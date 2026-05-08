@@ -1,0 +1,11 @@
+{
+  "name": "codex-provider-sync-full",
+  "private": true,
+  "packageManager": "pnpm@10.12.1",
+  "scripts": {
+    "dev": "pnpm -C packages/desktop tauri dev",
+    "build": "pnpm -C packages/desktop build",
+    "bundle:mac": "pnpm -C packages/desktop tauri build --bundles dmg",
+    "bundle:win": "pnpm -C packages/desktop tauri build --bundles nsis"
+  }
+}
