@@ -2,6 +2,10 @@
 
 一个可直接二改的完整模板：React + Vite + Tauri 桌面应用，支持 macOS 与 Windows 打包。
 
+## 开源致谢
+
+本项目是在 GitHub 开源项目 [Dailin521/codex-provider-sync](https://github.com/Dailin521/codex-provider-sync) 提供的思路基础上二次修改而来。感谢第一代作者的探索与开源分享。
+
 ## 当前功能
 
 - 扫描 `.codex` 目录
@@ -19,7 +23,8 @@
 - 自动备份
 - 列出备份并显示备份日期
 - 从备份恢复
-- 删除备份，删除前会弹窗确认
+- 删除备份，删除前会显示应用内确认弹窗
+- 清理本工具数据，仅删除 provider-sync 备份目录和旧备份目录
 
 ## 本地开发
 
@@ -51,6 +56,7 @@ pnpm bundle:win
 - 如果跳转链接打不开，可在弹窗中复制 QQ 群号后手动搜索加入。
 - 备份目录为 `~/.codex/backups_state/provider-sync/<timestamp>`，并兼容读取旧的 `.provider-sync-backups`。
 - 备份包含 `sessions`、`archived_sessions`、`state_5.sqlite`、`state_5.sqlite-wal`、`state_5.sqlite-shm`、`config.toml`、`.codex-global-state.json`。
+- “清理本工具数据”只删除 `~/.codex/backups_state/provider-sync` 和 `~/.codex/.provider-sync-backups`，不会删除 `config.toml`、`auth.json`、`sessions`、`archived_sessions` 或 `state_5.sqlite`。
 - 含 `encrypted_content` 的历史会话跨 provider/account 后，通常只能恢复列表可见性，继续对话或 compact 仍可能失败。
 - 建议执行同步或恢复前关闭 Codex / Codex App / app-server，避免 SQLite 或 rollout 文件被占用。
 - 当前实现已通过前端 `pnpm -C packages/desktop build`；后端 Tauri/Rust 构建需要本机安装 Rust 工具链后再运行验证。

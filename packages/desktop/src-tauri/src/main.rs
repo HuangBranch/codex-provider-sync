@@ -81,6 +81,11 @@ struct BackupInfo {
 }
 
 #[derive(Serialize)]
+struct ClearToolDataResult {
+    removed_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct SyncResult {
     backup_id: Option<String>,
     target_provider: String,
@@ -239,6 +244,19 @@ fn delete_backup(codex_home: Option<String>, backup_id: String) -> Result<(), St
         .ok_or_else(|| format!("备份不存在: {}", backup_id))?;
     fs::remove_dir_all(&backup_dir).map_err(to_err)?;
     Ok(())
+}
+
+#[tauri::command]
+fn clear_tool_data(codex_home: Option<String>) -> Result<ClearToolDataResult, String> {
+    let home = resolve_codex_home(codex_home)?;
+    let mut removed_paths = vec![];
+    for path in [backups_root(&home), legacy_backups_root(&home)] {
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(to_err)?;
+            removed_paths.push(path.display().to_string());
+        }
+    }
+    Ok(ClearToolDataResult { removed_paths })
 }
 
 #[tauri::command]
@@ -1621,6 +1639,7 @@ fn main() {
             list_backups,
             restore_backup,
             delete_backup,
+            clear_tool_data,
             sync_provider,
             open_external_url
         ])

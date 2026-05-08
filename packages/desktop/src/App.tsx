@@ -6,6 +6,7 @@ const QQ_GROUP_NUMBER = "484630263";
 const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
 const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
 const APP_VERSION = "2.2.1";
+const UPSTREAM_PROJECT_URL = "https://github.com/Dailin521/codex-provider-sync";
 
 type ProviderStat = { provider: string; count: number; source: string };
 type ScanResult = {
@@ -31,6 +32,7 @@ type ScanResult = {
 };
 
 type BackupInfo = { id: string; path: string; created_at: string };
+type ClearToolDataResult = { removed_paths: string[] };
 type WorkspaceSyncResult = {
   present: boolean;
   updated: boolean;
@@ -70,6 +72,8 @@ export default function App() {
   const [copyMessage, setCopyMessage] = useState("");
   const [scan, setScan] = useState<ScanResult | null>(null);
   const [backups, setBackups] = useState<BackupInfo[]>([]);
+  const [deleteTarget, setDeleteTarget] = useState<BackupInfo | null>(null);
+  const [showClearToolDataDialog, setShowClearToolDataDialog] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -148,16 +152,30 @@ export default function App() {
     await doScan();
   }
 
-  async function doDeleteBackup(id: string) {
-    const confirmed = window.confirm(`确定要删除备份 ${id} 吗？删除后无法从这个备份恢复。`);
-    if (!confirmed) {
+  async function doDeleteBackup() {
+    if (!deleteTarget) {
       return;
     }
+    const id = deleteTarget.id;
     await run(() =>
       invoke("delete_backup", { codexHome: path.trim() || null, backupId: id })
     );
+    setDeleteTarget(null);
     setMessage(`备份已删除：${id}`);
     await refreshBackups();
+  }
+
+  async function doClearToolData() {
+    const data = await run(() =>
+      invoke<ClearToolDataResult>("clear_tool_data", { codexHome: path.trim() || null })
+    );
+    setShowClearToolDataDialog(false);
+    setBackups([]);
+    setMessage(
+      data.removed_paths.length > 0
+        ? `本工具数据已清理：${data.removed_paths.length} 个目录`
+        : "没有发现需要清理的本工具数据"
+    );
   }
 
   async function copyQQGroupNumber() {
@@ -187,6 +205,23 @@ export default function App() {
           onCopyJoinUrl={copyQQJoinUrl}
           onJoinGroup={joinQQGroup}
           onClose={() => setShowStartupNotice(false)}
+        />
+      )}
+
+      {deleteTarget && (
+        <DeleteBackupDialog
+          backup={deleteTarget}
+          busy={busy}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={doDeleteBackup}
+        />
+      )}
+
+      {showClearToolDataDialog && (
+        <ClearToolDataDialog
+          busy={busy}
+          onCancel={() => setShowClearToolDataDialog(false)}
+          onConfirm={doClearToolData}
         />
       )}
 
@@ -315,13 +350,25 @@ export default function App() {
                 <td style={td}>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                     <button style={btn} disabled={busy} onClick={() => doRestore(b.id)}>恢复</button>
-                    <button style={btnDanger} disabled={busy} onClick={() => doDeleteBackup(b.id)}>删除</button>
+                    <button style={btnDanger} disabled={busy} onClick={() => setDeleteTarget(b)}>删除</button>
                   </div>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+      </Card>
+
+      <Card title="维护与卸载">
+        <div style={maintenanceBox}>
+          <div>
+            <div style={{ fontWeight: 700 }}>清理本工具数据</div>
+            <div style={{ marginTop: 6, color: "#4b5563", lineHeight: 1.6 }}>
+              只删除本工具创建的 provider-sync 备份目录和旧备份目录，不会删除 Codex 的 config.toml、auth.json、sessions、archived_sessions 或 state_5.sqlite。
+            </div>
+          </div>
+          <button style={btnDanger} disabled={busy} onClick={() => setShowClearToolDataDialog(true)}>清理本工具数据</button>
+        </div>
       </Card>
     </div>
   );
@@ -360,6 +407,14 @@ function StartupNotice({
           </div>
         </div>
 
+        <div style={noticePanel}>
+          <div style={noticeLabel}>开源致谢</div>
+          <div style={{ color: "#374151", lineHeight: 1.7 }}>
+            本项目是在 GitHub 开源项目 Dailin521/codex-provider-sync 提供的思路基础上二次修改而来。
+            感谢第一代作者的探索与开源分享：{UPSTREAM_PROJECT_URL}
+          </div>
+        </div>
+
         <div style={groupBox}>
           <div>
             <div style={{ color: "#1d4ed8", fontSize: 12, fontWeight: 700 }}>邀请你加入</div>
@@ -376,6 +431,70 @@ function StartupNotice({
         <div style={modalActions}>
           <button style={btn} onClick={onClose}>关闭</button>
           <button style={btnPrimary} onClick={onJoinGroup}>加入交流群</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DeleteBackupDialog({
+  backup,
+  busy,
+  onCancel,
+  onConfirm
+}: {
+  backup: BackupInfo;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div style={modalBackdrop} role="dialog" aria-modal="true" aria-labelledby="delete-backup-title">
+      <div style={smallModalCard}>
+        <div style={{ color: "#b91c1c", fontSize: 13, fontWeight: 700, letterSpacing: 0.4 }}>删除确认</div>
+        <h2 id="delete-backup-title" style={{ margin: "8px 0 10px" }}>确定删除这个备份吗？</h2>
+        <div style={{ color: "#374151", lineHeight: 1.7 }}>
+          删除后无法从这个备份恢复，请确认你不再需要它。
+        </div>
+        <div style={deleteInfoBox}>
+          <div><strong>ID：</strong>{backup.id}</div>
+          <div><strong>日期：</strong>{formatDateTime(backup.created_at)}</div>
+          <div style={{ wordBreak: "break-all" }}><strong>路径：</strong>{backup.path}</div>
+        </div>
+        <div style={modalActions}>
+          <button style={btn} disabled={busy} onClick={onCancel}>取消</button>
+          <button style={btnDanger} disabled={busy} onClick={onConfirm}>确认删除</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClearToolDataDialog({
+  busy,
+  onCancel,
+  onConfirm
+}: {
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div style={modalBackdrop} role="dialog" aria-modal="true" aria-labelledby="clear-tool-data-title">
+      <div style={smallModalCard}>
+        <div style={{ color: "#b91c1c", fontSize: 13, fontWeight: 700, letterSpacing: 0.4 }}>清理确认</div>
+        <h2 id="clear-tool-data-title" style={{ margin: "8px 0 10px" }}>清理本工具数据？</h2>
+        <div style={{ color: "#374151", lineHeight: 1.7 }}>
+          这会删除本工具创建的备份目录，包括 provider-sync 当前备份目录和旧版备份目录。不会删除 Codex 账号、key、配置或历史会话。
+        </div>
+        <div style={deleteInfoBox}>
+          <div>将清理：~/.codex/backups_state/provider-sync</div>
+          <div>将清理：~/.codex/.provider-sync-backups</div>
+          <div>不会清理：config.toml、auth.json、sessions、archived_sessions、state_5.sqlite</div>
+        </div>
+        <div style={modalActions}>
+          <button style={btn} disabled={busy} onClick={onCancel}>取消</button>
+          <button style={btnDanger} disabled={busy} onClick={onConfirm}>确认清理</button>
         </div>
       </div>
     </div>
@@ -460,8 +579,11 @@ const btnPrimary: React.CSSProperties = { ...btn, background: "#111827", color: 
 const btnDanger: React.CSSProperties = { ...btn, color: "#b91c1c", border: "1px solid #fecaca", background: "#fef2f2" };
 const modalBackdrop: React.CSSProperties = { position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(15, 23, 42, 0.46)", backdropFilter: "blur(6px)" };
 const modalCard: React.CSSProperties = { width: "min(560px, 100%)", borderRadius: 20, padding: 24, background: "#ffffff", boxShadow: "0 24px 80px rgba(15, 23, 42, 0.28)", border: "1px solid rgba(191, 219, 254, 0.9)" };
+const smallModalCard: React.CSSProperties = { width: "min(500px, 100%)", borderRadius: 20, padding: 24, background: "#ffffff", boxShadow: "0 24px 80px rgba(15, 23, 42, 0.28)", border: "1px solid #fecaca" };
 const groupBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginTop: 16, padding: 16, borderRadius: 16, background: "#eff6ff", border: "1px solid #bfdbfe" };
+const maintenanceBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, padding: 14, borderRadius: 14, background: "#f9fafb", border: "1px solid #eef2f7" };
 const noticePanel: React.CSSProperties = { marginTop: 14, padding: 14, borderRadius: 14, background: "#f9fafb", border: "1px solid #eef2f7" };
+const deleteInfoBox: React.CSSProperties = { display: "grid", gap: 8, marginTop: 14, padding: 14, borderRadius: 14, background: "#fef2f2", border: "1px solid #fecaca", color: "#374151" };
 const noticeLabel: React.CSSProperties = { marginBottom: 6, color: "#6b7280", fontSize: 12, fontWeight: 700 };
 const modalActions: React.CSSProperties = { display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 };
 const table: React.CSSProperties = { width: "100%", borderCollapse: "collapse", fontSize: 14 };
