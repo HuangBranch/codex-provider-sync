@@ -5,7 +5,7 @@ const QQ_GROUP_NAME = "Codex Provider Sync 用户交流群";
 const QQ_GROUP_NUMBER = "484630263";
 const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
 const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
-const APP_VERSION = "2.2.1";
+const APP_VERSION = "2.2.2";
 const UPSTREAM_PROJECT_URL = "https://github.com/Dailin521/codex-provider-sync";
 
 type ProviderStat = { provider: string; count: number; source: string };
@@ -18,7 +18,10 @@ type ScanResult = {
   config_exists: boolean;
   global_state_exists: boolean;
   current_provider: string;
+  current_provider_source: string;
   configured_providers: string[];
+  reserved_provider_conflicts: string[];
+  config_warnings: string[];
   provider_stats: ProviderStat[];
   encrypted_content_stats: ProviderStat[];
   locked_rollout_files: string[];
@@ -33,6 +36,10 @@ type ScanResult = {
 
 type BackupInfo = { id: string; path: string; created_at: string };
 type ClearToolDataResult = { removed_paths: string[] };
+type ConfigRepairResult = {
+  backup_path: string;
+  renamed_providers: { from: string; to: string }[];
+};
 type WorkspaceSyncResult = {
   present: boolean;
   updated: boolean;
@@ -52,6 +59,8 @@ type SyncResult = {
   changed_sqlite_cwd_rows: number;
   changed_config: boolean;
   workspace_roots: WorkspaceSyncResult;
+  protected_encrypted_rollout_files: string[];
+  protected_encrypted_thread_count: number;
   encrypted_content_warning?: string | null;
 };
 type ProjectVisibility = {
@@ -77,16 +86,20 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
-  const canSync = Boolean(scan && scan.config_exists && scan.current_provider);
+  const hasProviderConflict = Boolean(scan?.reserved_provider_conflicts.length);
+  const canSync = Boolean(scan && scan.config_exists && scan.current_provider && !hasProviderConflict);
 
   useEffect(() => {
     void refreshBackups();
   }, []);
 
-  async function run<T>(fn: () => Promise<T>) {
+  async function run<T>(fn: () => Promise<T>, options: { resetStatus?: boolean } = {}) {
+    const resetStatus = options.resetStatus ?? true;
     setBusy(true);
-    setError("");
-    setMessage("");
+    if (resetStatus) {
+      setError("");
+      setMessage("");
+    }
     try {
       return await fn();
     } catch (e) {
@@ -97,13 +110,16 @@ export default function App() {
     }
   }
 
-  async function doScan() {
+  async function doScan(options: { silent?: boolean; preserveStatus?: boolean } = {}) {
     const data = await run(() =>
       invoke<ScanResult>("scan_codex_home", { codexHome: path.trim() || null })
-    );
+    , { resetStatus: !options.preserveStatus });
     setScan(data);
-    setMessage("扫描完成");
+    if (!options.silent) {
+      setMessage("扫描完成");
+    }
     await refreshBackups();
+    return data;
   }
 
   async function doBackup() {
@@ -127,6 +143,9 @@ export default function App() {
         `rollout ${data.changed_rollout_files} 个`,
         `SQLite ${data.changed_sqlite_rows} 行`,
         `workspace roots ${data.workspace_roots.updated ? "已更新" : "未变化"}`,
+        data.protected_encrypted_thread_count > 0
+          ? `保护 ${data.protected_encrypted_thread_count} 个 encrypted 线程未硬改 provider`
+          : "",
         "config.toml 未修改",
         data.skipped_rollout_files.length > 0 ? `跳过 ${data.skipped_rollout_files.length} 个占用/变化文件` : ""
       ].filter(Boolean).join("，")
@@ -134,7 +153,18 @@ export default function App() {
     if (data.encrypted_content_warning) {
       setError(data.encrypted_content_warning);
     }
-    await doScan();
+    await doScan({ silent: true, preserveStatus: true });
+  }
+
+  async function doRepairProviderConflicts() {
+    const data = await run(() =>
+      invoke<ConfigRepairResult>("repair_reserved_provider_conflicts", {
+        codexHome: path.trim() || null
+      })
+    );
+    const renamed = data.renamed_providers.map((item) => `${item.from} -> ${item.to}`).join("，");
+    setMessage(`已修复 provider 命名冲突：${renamed}。原 config.toml 已备份到 ${data.backup_path}`);
+    await doScan({ silent: true, preserveStatus: true });
   }
 
   async function refreshBackups() {
@@ -149,7 +179,7 @@ export default function App() {
       invoke("restore_backup", { codexHome: path.trim() || null, backupId: id })
     );
     setMessage(`恢复完成：${id}`);
-    await doScan();
+    await doScan({ silent: true, preserveStatus: true });
   }
 
   async function doDeleteBackup() {
@@ -242,10 +272,15 @@ export default function App() {
             <div>
               <div style={{ color: "#6b7280", fontSize: 12 }}>同步目标</div>
               <div style={{ marginTop: 6, fontWeight: 700 }}>
-                当前 config.toml provider：{scan?.current_provider || "请先扫描"}
+                当前 provider：{scan?.current_provider || "请先扫描"}
               </div>
+              {scan?.current_provider_source && (
+                <div style={{ marginTop: 4, color: "#2563eb", fontSize: 13 }}>
+                  来源：{scan.current_provider_source}
+                </div>
+              )}
               <div style={{ marginTop: 6, color: "#4b5563", lineHeight: 1.6 }}>
-                以当前配置为准，只同步历史会话、SQLite 与 workspace roots；不会修改 config.toml、自定义 URL、key 或 CCS 管理的账号配置。
+                以当前 provider 为准，只同步可安全处理的历史会话、SQLite 线程可见性与 workspace roots；不会修改 API key、自定义 URL 或账号授权。
               </div>
             </div>
             <label style={{ whiteSpace: "nowrap" }}>
@@ -253,10 +288,24 @@ export default function App() {
             </label>
           </div>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-            <button style={btn} disabled={busy} onClick={doScan}>扫描</button>
+            <button style={btn} disabled={busy} onClick={() => doScan()}>扫描</button>
             <button style={btn} disabled={busy} onClick={doBackup}>立即备份</button>
             <button style={btnPrimary} disabled={busy || !canSync} onClick={doSync}>执行同步</button>
           </div>
+          {hasProviderConflict && (
+            <div style={dangerPanel}>
+              <div style={{ fontWeight: 800 }}>发现 Codex 保留 provider 名冲突</div>
+              <div style={{ marginTop: 6, lineHeight: 1.7 }}>
+                当前 config.toml 里存在 {scan?.reserved_provider_conflicts.map((id) => `[model_providers.${id}]`).join("，")}。
+                Codex 官方内置 provider 名不能被自定义 provider 覆盖，否则会出现“Invalid configuration: reserved built-in provider IDs”的报错。
+              </div>
+              <div style={{ marginTop: 12 }}>
+                <button style={btnDanger} disabled={busy} onClick={doRepairProviderConflicts}>
+                  备份并改名为 openai-custom
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </Card>
 
@@ -269,6 +318,7 @@ export default function App() {
             <KV k="Codex 目录" v={scan.codex_home} />
             <KV k="目录存在" v={String(scan.exists)} />
             <KV k="当前 provider" v={scan.current_provider} />
+            <KV k="provider 来源" v={scan.current_provider_source || "-"} />
             <KV k="sessions 文件数" v={String(scan.sessions_count)} />
             <KV k="archived_sessions 文件数" v={String(scan.archived_sessions_count)} />
             <KV k="state_5.sqlite" v={String(scan.state_db_exists)} />
@@ -286,6 +336,14 @@ export default function App() {
               }
             />
           </Grid>
+          {scan.config_warnings.length > 0 && (
+            <div style={{ marginTop: 18 }}>
+              <Alert color="#92400e" bg="#fffbeb" border="#fde68a">
+                <div style={{ fontWeight: 800, marginBottom: 6 }}>配置提醒</div>
+                <List items={scan.config_warnings} />
+              </Alert>
+            </div>
+          )}
           <h3 style={{ marginTop: 18 }}>Provider 分布</h3>
           <ProviderTable rows={scan.provider_stats} empty="未发现 provider 相关字段" />
 
@@ -574,6 +632,7 @@ function Grid({ children }: { children: React.ReactNode }) {
 const wrap: React.CSSProperties = { maxWidth: 1100, margin: "28px auto", padding: 20, fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', color: "#111827", background: "#f8fafc" };
 const input: React.CSSProperties = { width: "100%", padding: "10px 12px", border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, boxSizing: "border-box" };
 const strategyBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, padding: 14, border: "1px solid #dbeafe", borderRadius: 12, background: "#eff6ff" };
+const dangerPanel: React.CSSProperties = { padding: 14, borderRadius: 12, border: "1px solid #fecaca", background: "#fef2f2", color: "#7f1d1d" };
 const btn: React.CSSProperties = { padding: "10px 14px", borderRadius: 8, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" };
 const btnPrimary: React.CSSProperties = { ...btn, background: "#111827", color: "#fff", border: "1px solid #111827" };
 const btnDanger: React.CSSProperties = { ...btn, color: "#b91c1c", border: "1px solid #fecaca", background: "#fef2f2" };

@@ -16,6 +16,8 @@ const DB_FILE: &str = "state_5.sqlite";
 const GLOBAL_STATE_FILE: &str = ".codex-global-state.json";
 const GLOBAL_STATE_BACKUP_FILE: &str = ".codex-global-state.json.bak";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
+const DEFAULT_BUILTIN_PROVIDER: &str = "openai";
+const RESERVED_BUILTIN_PROVIDER_IDS: [&str; 1] = ["openai"];
 
 #[derive(Serialize, Clone)]
 struct ProviderStat {
@@ -30,6 +32,15 @@ struct ProviderCounts {
     archived_sessions: BTreeMap<String, u64>,
 }
 
+#[derive(Default, Clone)]
+struct ConfigInfo {
+    current_provider: String,
+    current_provider_source: String,
+    configured_providers: Vec<String>,
+    reserved_provider_conflicts: Vec<String>,
+    warnings: Vec<String>,
+}
+
 #[derive(Default)]
 struct RolloutCollection {
     changes: Vec<RolloutChange>,
@@ -38,6 +49,9 @@ struct RolloutCollection {
     locked_paths: Vec<String>,
     user_event_thread_ids: HashSet<String>,
     thread_cwd_by_id: HashMap<String, String>,
+    provider_sync_thread_ids: HashSet<String>,
+    protected_encrypted_paths: Vec<String>,
+    protected_encrypted_thread_ids: HashSet<String>,
 }
 
 struct RolloutChange {
@@ -63,7 +77,10 @@ struct ScanResult {
     config_exists: bool,
     global_state_exists: bool,
     current_provider: String,
+    current_provider_source: String,
     configured_providers: Vec<String>,
+    reserved_provider_conflicts: Vec<String>,
+    config_warnings: Vec<String>,
     provider_stats: Vec<ProviderStat>,
     encrypted_content_stats: Vec<ProviderStat>,
     locked_rollout_files: Vec<String>,
@@ -86,6 +103,18 @@ struct ClearToolDataResult {
 }
 
 #[derive(Serialize)]
+struct ConfigProviderRename {
+    from: String,
+    to: String,
+}
+
+#[derive(Serialize)]
+struct ConfigRepairResult {
+    backup_path: String,
+    renamed_providers: Vec<ConfigProviderRename>,
+}
+
+#[derive(Serialize)]
 struct SyncResult {
     backup_id: Option<String>,
     target_provider: String,
@@ -99,6 +128,8 @@ struct SyncResult {
     changed_sqlite_cwd_rows: u64,
     changed_config: bool,
     workspace_roots: WorkspaceSyncResult,
+    protected_encrypted_rollout_files: Vec<String>,
+    protected_encrypted_thread_count: u64,
     encrypted_content_warning: Option<String>,
 }
 
@@ -169,7 +200,7 @@ fn scan_codex_home(codex_home: Option<String>) -> Result<ScanResult, String> {
     let global_state = home.join(GLOBAL_STATE_FILE);
 
     let rollout = collect_rollout_metadata(&home, None)?;
-    let (current_provider, configured_providers) = read_config_info(&config_toml);
+    let config_info = read_config_info(&config_toml);
     let mut provider_stats = provider_counts_to_stats(&rollout.provider_counts);
     provider_stats.extend(scan_sqlite_provider_stats(&state_db)?);
     let encrypted_content_stats =
@@ -186,8 +217,11 @@ fn scan_codex_home(codex_home: Option<String>) -> Result<ScanResult, String> {
         state_db_exists: state_db.exists(),
         config_exists: config_toml.exists(),
         global_state_exists: global_state.exists(),
-        current_provider,
-        configured_providers,
+        current_provider: config_info.current_provider,
+        current_provider_source: config_info.current_provider_source,
+        configured_providers: config_info.configured_providers,
+        reserved_provider_conflicts: config_info.reserved_provider_conflicts,
+        config_warnings: config_info.warnings,
         provider_stats,
         encrypted_content_stats,
         locked_rollout_files: rollout.locked_paths,
@@ -260,6 +294,55 @@ fn clear_tool_data(codex_home: Option<String>) -> Result<ClearToolDataResult, St
 }
 
 #[tauri::command]
+fn repair_reserved_provider_conflicts(codex_home: Option<String>) -> Result<ConfigRepairResult, String> {
+    let home = resolve_codex_home(codex_home)?;
+    let config_toml = home.join("config.toml");
+    if !config_toml.exists() {
+        return Err("找不到 config.toml，无法修复 provider 命名冲突。".to_string());
+    }
+
+    let original_text = fs::read_to_string(&config_toml).map_err(to_err)?;
+    let config_info = read_config_info(&config_toml);
+    if config_info.reserved_provider_conflicts.is_empty() {
+        return Err("没有发现需要修复的保留 provider 名冲突。".to_string());
+    }
+
+    let mut existing: HashSet<String> = config_info.configured_providers.iter().cloned().collect();
+    let mut rename_map = BTreeMap::new();
+    for from in config_info.reserved_provider_conflicts {
+        let to = unique_custom_provider_id(&from, &existing);
+        existing.insert(to.clone());
+        rename_map.insert(from, to);
+    }
+
+    let backup_path = config_toml.with_file_name(format!(
+        "config.toml.provider-sync-{}.bak",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    fs::copy(&config_toml, &backup_path).map_err(to_err)?;
+
+    let mut next_text = String::new();
+    let mut in_root_section = true;
+    for chunk in original_text.split_inclusive('\n') {
+        let trimmed = chunk.trim();
+        next_text.push_str(&rename_config_chunk(chunk, &rename_map, in_root_section));
+        if trimmed.starts_with('[') {
+            in_root_section = false;
+        }
+    }
+
+    fs::write(&config_toml, next_text).map_err(to_err)?;
+
+    Ok(ConfigRepairResult {
+        backup_path: backup_path.display().to_string(),
+        renamed_providers: rename_map
+            .into_iter()
+            .map(|(from, to)| ConfigProviderRename { from, to })
+            .collect(),
+    })
+}
+
+#[tauri::command]
 fn sync_provider(
     codex_home: Option<String>,
     auto_backup: bool,
@@ -269,8 +352,14 @@ fn sync_provider(
     if !config_toml.exists() {
         return Err("找不到 config.toml，无法确定当前 provider。请先用 Codex/CCS 配置好账号后再同步。".to_string());
     }
-    let (target_provider, _) = read_config_info(&config_toml);
-    let target = target_provider.trim();
+    let config_info = read_config_info(&config_toml);
+    if !config_info.reserved_provider_conflicts.is_empty() {
+        return Err(format!(
+            "config.toml 中存在保留 provider 名冲突：{}。请先在本工具中修复，或手动把自定义 provider 改名为 openai-custom 这类非保留名称。",
+            config_info.reserved_provider_conflicts.join(", ")
+        ));
+    }
+    let target = config_info.current_provider.trim();
     if target.is_empty() {
         return Err("config.toml 中没有读取到根级 model_provider，无法确定同步目标。请先用 CCS 切换到目标账号/provider。".to_string());
     }
@@ -291,6 +380,7 @@ fn sync_provider(
         target,
         &rollout.user_event_thread_ids,
         &rollout.thread_cwd_by_id,
+        &rollout.provider_sync_thread_ids,
     )?;
     let workspace_roots = sync_workspace_roots(&home)?;
 
@@ -307,6 +397,8 @@ fn sync_provider(
         changed_sqlite_cwd_rows: sqlite_stats.cwd_rows,
         changed_config: false,
         workspace_roots,
+        protected_encrypted_rollout_files: rollout.protected_encrypted_paths,
+        protected_encrypted_thread_count: rollout.protected_encrypted_thread_ids.len() as u64,
         encrypted_content_warning,
     })
 }
@@ -593,32 +685,47 @@ fn collect_rollout_metadata(
                 .and_then(|v| v.as_str())
                 .unwrap_or("(missing)")
                 .to_string();
+            let thread_id = session_meta_id(&parsed);
+            let has_encrypted_content = content.contains("encrypted_content");
             increment_provider_count(&mut out.provider_counts, dir_name, &current_provider);
 
             if let Some((thread_id, cwd)) = session_meta_id_and_cwd(&parsed) {
                 out.thread_cwd_by_id
                     .insert(thread_id, to_desktop_workspace_path(&cwd));
             }
-            if content.contains("encrypted_content") {
+            if has_encrypted_content {
                 increment_provider_count(
                     &mut out.encrypted_content_counts,
                     dir_name,
                     &current_provider,
                 );
             }
-            if let Some(thread_id) = session_meta_id(&parsed) {
+            if let Some(thread_id) = &thread_id {
                 if file_has_user_event(&content) {
-                    out.user_event_thread_ids.insert(thread_id);
+                    out.user_event_thread_ids.insert(thread_id.clone());
                 }
             }
 
             if let Some(target) = target_provider {
-                if current_provider != target {
+                if current_provider == target {
+                    if let Some(thread_id) = &thread_id {
+                        out.provider_sync_thread_ids.insert(thread_id.clone());
+                    }
+                } else if has_encrypted_content {
+                    out.protected_encrypted_paths
+                        .push(entry.path().display().to_string());
+                    if let Some(thread_id) = &thread_id {
+                        out.protected_encrypted_thread_ids.insert(thread_id.clone());
+                    }
+                } else {
                     if let Some(payload) = parsed.get_mut("payload").and_then(|v| v.as_object_mut()) {
                         payload.insert(
                             "model_provider".to_string(),
                             Value::String(target.to_string()),
                         );
+                        if let Some(thread_id) = &thread_id {
+                            out.provider_sync_thread_ids.insert(thread_id.clone());
+                        }
                         out.changes.push(RolloutChange {
                             path: entry.path().to_path_buf(),
                             original_first_line: record.first_line,
@@ -632,6 +739,8 @@ fn collect_rollout_metadata(
     }
     out.locked_paths.sort();
     out.locked_paths.dedup();
+    out.protected_encrypted_paths.sort();
+    out.protected_encrypted_paths.dedup();
     Ok(out)
 }
 
@@ -867,6 +976,7 @@ fn sync_sqlite_session_state(
     target: &str,
     user_event_thread_ids: &HashSet<String>,
     thread_cwd_by_id: &HashMap<String, String>,
+    provider_sync_thread_ids: &HashSet<String>,
 ) -> Result<SqliteSyncStats, String> {
     if !path.exists() {
         return Ok(SqliteSyncStats::default());
@@ -880,21 +990,24 @@ fn sync_sqlite_session_state(
     if table_exists_tx(&tx, "threads")? {
         let columns = sqlite_columns_tx(&tx, "threads")?;
         if columns.contains("model_provider") {
-            let changed: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
-                    params![target],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            if changed > 0 {
-                tx.execute(
-                    "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-                    params![target],
-                )
-                .map_err(|e| sqlite_err(e, "update SQLite session provider"))?;
-                stats.provider_rows = changed as u64;
+            let mut updated = 0u64;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
+                    )
+                    .map_err(|e| sqlite_err(e, "update SQLite session provider"))?;
+                for thread_id in provider_sync_thread_ids {
+                    if thread_id.trim().is_empty() {
+                        continue;
+                    }
+                    updated += stmt
+                        .execute(params![target, thread_id])
+                        .map_err(|e| sqlite_err(e, "update SQLite session provider"))?
+                        as u64;
+                }
             }
+            stats.provider_rows = updated;
         }
         if columns.contains("has_user_event") {
             let mut updated = 0u64;
@@ -930,34 +1043,6 @@ fn sync_sqlite_session_state(
                 }
             }
             stats.cwd_rows = updated;
-        }
-    }
-
-    let tables = sqlite_tables_tx(&tx)?;
-    for table in tables {
-        let cols = sqlite_provider_columns_tx(&tx, &table)?;
-        for col in cols {
-            if table == "threads" && col == "model_provider" {
-                continue;
-            }
-            let count_sql = format!(
-                "SELECT COUNT(*) FROM {table} WHERE {col} IS NOT NULL AND CAST({col} AS TEXT) != ?1",
-                table = quote_ident(&table),
-                col = quote_ident(&col)
-            );
-            let changed: i64 = tx
-                .query_row(&count_sql, params![target], |row| row.get(0))
-                .unwrap_or(0);
-            if changed > 0 {
-                let update_sql = format!(
-                    "UPDATE {table} SET {col} = ?1 WHERE {col} IS NOT NULL AND CAST({col} AS TEXT) != ?1",
-                    table = quote_ident(&table),
-                    col = quote_ident(&col)
-                );
-                tx.execute(&update_sql, params![target])
-                    .map_err(|e| sqlite_err(e, "update generic SQLite provider columns"))?;
-                stats.generic_provider_rows += changed as u64;
-            }
         }
     }
 
@@ -1106,16 +1191,19 @@ fn sqlite_provider_columns_tx(tx: &rusqlite::Transaction<'_>, table: &str) -> Re
         .collect())
 }
 
-fn read_config_info(path: &Path) -> (String, Vec<String>) {
+fn read_config_info(path: &Path) -> ConfigInfo {
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut current = String::new();
+    let mut current_source = String::new();
     let mut configured = HashSet::new();
+    let mut in_root_section = true;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if trimmed.starts_with("[model_providers.") {
+            in_root_section = false;
             if let Some(id) = trimmed
                 .strip_prefix("[model_providers.")
                 .and_then(|v| v.strip_suffix(']'))
@@ -1125,21 +1213,171 @@ fn read_config_info(path: &Path) -> (String, Vec<String>) {
             continue;
         }
         if trimmed.starts_with('[') {
+            in_root_section = false;
             continue;
         }
-        if let Some((key, value)) = trimmed.split_once('=') {
-            if key.trim() == "model_provider" {
-                current = value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
+        if in_root_section && current.is_empty() {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                if key.trim() == "model_provider" {
+                    current = parse_toml_scalar_value(value);
+                    current_source = "config.toml 根级 model_provider".to_string();
+                }
             }
         }
     }
     let mut configured: Vec<_> = configured.into_iter().collect();
     configured.sort();
-    (current, configured)
+    let reserved_provider_conflicts: Vec<_> = configured
+        .iter()
+        .filter(|id| RESERVED_BUILTIN_PROVIDER_IDS.contains(&id.as_str()))
+        .cloned()
+        .collect();
+    let mut warnings = vec![];
+    if !reserved_provider_conflicts.is_empty() {
+        warnings.push(format!(
+            "config.toml 中的 [model_providers.{}] 使用了 Codex 保留内置 provider 名，Codex 会拒绝启动或拒绝设置模型。",
+            reserved_provider_conflicts.join("] / [model_providers.")
+        ));
+    }
+    if path.exists() && current.trim().is_empty() {
+        current = DEFAULT_BUILTIN_PROVIDER.to_string();
+        current_source = "Codex 内置默认 provider（官方订阅账号）".to_string();
+        warnings.push("未发现根级 model_provider，本工具按 Codex 官方订阅默认 provider openai 处理。".to_string());
+    }
+    ConfigInfo {
+        current_provider: current,
+        current_provider_source: current_source,
+        configured_providers: configured,
+        reserved_provider_conflicts,
+        warnings,
+    }
+}
+
+fn parse_toml_scalar_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some(quote) = trimmed.chars().next().filter(|ch| *ch == '"' || *ch == '\'') else {
+        return trimmed
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    };
+    let quote_len = quote.len_utf8();
+    let after_quote = &trimmed[quote_len..];
+    let Some(end) = after_quote.find(quote) else {
+        return after_quote.trim().to_string();
+    };
+    after_quote[..end].to_string()
+}
+
+fn unique_custom_provider_id(from: &str, existing: &HashSet<String>) -> String {
+    let base = format!("{}-custom", from);
+    if !existing.contains(&base) {
+        return base;
+    }
+    for index in 2..100 {
+        let candidate = format!("{}-{}", base, index);
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{}-{}", base, Local::now().format("%H%M%S"))
+}
+
+fn rename_model_provider_section_chunk(chunk: &str, rename_map: &BTreeMap<String, String>) -> String {
+    let trimmed = chunk.trim();
+    let Some(inner) = trimmed
+        .strip_prefix("[model_providers.")
+        .and_then(|v| v.strip_suffix(']'))
+    else {
+        return chunk.to_string();
+    };
+    let quoted = inner.starts_with('"') && inner.ends_with('"') && inner.len() >= 2;
+    let id = inner.trim_matches('"');
+    let Some(next_id) = rename_map.get(id) else {
+        return chunk.to_string();
+    };
+    let next_inner = if quoted {
+        format!("\"{}\"", next_id)
+    } else {
+        next_id.clone()
+    };
+    chunk.replacen(
+        &format!("[model_providers.{}]", inner),
+        &format!("[model_providers.{}]", next_inner),
+        1,
+    )
+}
+
+fn rename_config_chunk(
+    chunk: &str,
+    rename_map: &BTreeMap<String, String>,
+    in_root_section: bool,
+) -> String {
+    let section = rename_model_provider_section_chunk(chunk, rename_map);
+    if section != chunk {
+        return section;
+    }
+    if !in_root_section {
+        return chunk.to_string();
+    }
+    let (body, newline) = split_line_ending(chunk);
+    let Some((key_part, value_part)) = body.split_once('=') else {
+        return chunk.to_string();
+    };
+    if key_part.trim() != "model_provider" {
+        return chunk.to_string();
+    }
+    let leading_ws_len = value_part.len() - value_part.trim_start().len();
+    let leading_ws = &value_part[..leading_ws_len];
+    let rest = &value_part[leading_ws_len..];
+    if let Some(next) = rename_quoted_value(rest, rename_map) {
+        return format!("{}={}{}{}{}", key_part, leading_ws, next, "", newline);
+    }
+    if let Some(next) = rename_unquoted_value(rest, rename_map) {
+        return format!("{}={}{}{}{}", key_part, leading_ws, next, "", newline);
+    }
+    chunk.to_string()
+}
+
+fn split_line_ending(value: &str) -> (&str, &str) {
+    if let Some(body) = value.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = value.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (value, "")
+    }
+}
+
+fn rename_quoted_value(rest: &str, rename_map: &BTreeMap<String, String>) -> Option<String> {
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let quote_len = quote.len_utf8();
+    let after_quote = &rest[quote_len..];
+    let end = after_quote.find(quote)?;
+    let id = &after_quote[..end];
+    let next = rename_map.get(id)?;
+    let suffix = &after_quote[end + quote_len..];
+    Some(format!("{}{}{}{}", quote, next, quote, suffix))
+}
+
+fn rename_unquoted_value(rest: &str, rename_map: &BTreeMap<String, String>) -> Option<String> {
+    let token_len = rest
+        .find(|ch: char| ch.is_whitespace() || ch == '#')
+        .unwrap_or(rest.len());
+    if token_len == 0 {
+        return None;
+    }
+    let id = &rest[..token_len];
+    let next = rename_map.get(id)?;
+    Some(format!("{}{}", next, &rest[token_len..]))
 }
 
 fn read_project_visibility(home: &Path) -> Result<Vec<ProjectVisibility>, String> {
@@ -1640,6 +1878,7 @@ fn main() {
             restore_backup,
             delete_backup,
             clear_tool_data,
+            repair_reserved_provider_conflicts,
             sync_provider,
             open_external_url
         ])
