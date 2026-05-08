@@ -17,8 +17,9 @@
 - 修复 `.codex-global-state.json` 中 workspace roots 相关路径
 - 以当前 `config.toml` 根级 `model_provider` 为同步目标，不修改 `config.toml`
 - 自动备份
-- 列出备份
+- 列出备份并显示备份日期
 - 从备份恢复
+- 删除备份，删除前会弹窗确认
 
 ## 本地开发
 
@@ -43,9 +44,10 @@ pnpm bundle:win
 
 ## 注意
 
+- 当前版本为 `2.2.1`。
 - 如果使用 CCS 切换账号/provider，请先在 CCS 中切到目标账号，再打开本工具扫描和同步。
 - 本工具不会修改 `config.toml`，也不会覆盖自定义 URL、API key 或 auth 配置；它只把历史会话、SQLite provider 元数据和 workspace roots 同步到当前配置。
-- 当前 QQ 群弹窗用于引导加入交流群，不强制校验进群状态；群号 `484630263`，加群链接为 `https://qm.qq.com/q/ZSq3H3Iu0q`。
+- 当前 QQ 群弹窗用于引导加入交流群，不强制校验进群状态；群号 `484630263`，加群链接为 `https://qm.qq.com/q/ZSq3H3Iu0q`，点击“加入交流群”会调用系统默认浏览器打开。
 - 如果跳转链接打不开，可在弹窗中复制 QQ 群号后手动搜索加入。
 - 备份目录为 `~/.codex/backups_state/provider-sync/<timestamp>`，并兼容读取旧的 `.provider-sync-backups`。
 - 备份包含 `sessions`、`archived_sessions`、`state_5.sqlite`、`state_5.sqlite-wal`、`state_5.sqlite-shm`、`config.toml`、`.codex-global-state.json`。

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -76,6 +77,7 @@ struct ScanResult {
 struct BackupInfo {
     id: String,
     path: String,
+    created_at: String,
 }
 
 #[derive(Serialize)]
@@ -231,6 +233,15 @@ fn restore_backup(codex_home: Option<String>, backup_id: String) -> Result<(), S
 }
 
 #[tauri::command]
+fn delete_backup(codex_home: Option<String>, backup_id: String) -> Result<(), String> {
+    let home = resolve_codex_home(codex_home)?;
+    let backup_dir = find_backup_dir(&home, &backup_id)
+        .ok_or_else(|| format!("备份不存在: {}", backup_id))?;
+    fs::remove_dir_all(&backup_dir).map_err(to_err)?;
+    Ok(())
+}
+
+#[tauri::command]
 fn sync_provider(
     codex_home: Option<String>,
     auto_backup: bool,
@@ -282,6 +293,38 @@ fn sync_provider(
     })
 }
 
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("仅支持打开 http/https 链接".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.arg(trimmed);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", trimmed]);
+        cmd
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(trimmed);
+        cmd
+    };
+
+    command.spawn().map_err(to_err)?;
+    Ok(())
+}
+
 struct ApplyRolloutResult {
     applied: u64,
     skipped_paths: Vec<String>,
@@ -314,6 +357,7 @@ fn collect_backup_infos(root: &Path, out: &mut Vec<BackupInfo>) -> Result<(), St
         if path.is_dir() {
             out.push(BackupInfo {
                 id: entry.file_name().to_string_lossy().to_string(),
+                created_at: read_backup_created_at(&path, &entry.file_name().to_string_lossy()),
                 path: path.display().to_string(),
             });
         }
@@ -321,7 +365,41 @@ fn collect_backup_infos(root: &Path, out: &mut Vec<BackupInfo>) -> Result<(), St
     Ok(())
 }
 
+fn read_backup_created_at(path: &Path, id: &str) -> String {
+    if let Ok(text) = fs::read_to_string(path.join("metadata.json")) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let Some(created_at) = value.get("createdAt").and_then(|v| v.as_str()) {
+                if !created_at.trim().is_empty() {
+                    return created_at.to_string();
+                }
+            }
+        }
+    }
+    if let Some(created_at) = backup_id_to_display_date(id) {
+        return created_at;
+    }
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(|modified| {
+            let datetime: chrono::DateTime<Local> = modified.into();
+            datetime.to_rfc3339()
+        })
+        .unwrap_or_else(|_| "-".to_string())
+}
+
+fn backup_id_to_display_date(id: &str) -> Option<String> {
+    if id.len() < 15 {
+        return None;
+    }
+    let raw = &id[..15];
+    let parsed = chrono::NaiveDateTime::parse_from_str(raw, "%Y%m%d-%H%M%S").ok()?;
+    Some(parsed.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
 fn find_backup_dir(home: &Path, id: &str) -> Option<PathBuf> {
+    if !is_safe_backup_id(id) {
+        return None;
+    }
     let current = backups_root(home).join(id);
     if current.exists() {
         return Some(current);
@@ -331,6 +409,15 @@ fn find_backup_dir(home: &Path, id: &str) -> Option<PathBuf> {
         return Some(legacy);
     }
     None
+}
+
+fn is_safe_backup_id(id: &str) -> bool {
+    let trimmed = id.trim();
+    !trimmed.is_empty()
+        && trimmed != "."
+        && trimmed != ".."
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
 }
 
 fn create_backup_internal(home: &Path) -> Result<BackupInfo, String> {
@@ -369,6 +456,7 @@ fn create_backup_internal(home: &Path) -> Result<BackupInfo, String> {
 
     Ok(BackupInfo {
         id,
+        created_at: Local::now().to_rfc3339(),
         path: dir.display().to_string(),
     })
 }
@@ -1532,7 +1620,9 @@ fn main() {
             create_backup,
             list_backups,
             restore_backup,
-            sync_provider
+            delete_backup,
+            sync_provider,
+            open_external_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

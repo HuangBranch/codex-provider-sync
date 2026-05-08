@@ -5,7 +5,7 @@ const QQ_GROUP_NAME = "Codex Provider Sync 用户交流群";
 const QQ_GROUP_NUMBER = "484630263";
 const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
 const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "2.2.1";
 
 type ProviderStat = { provider: string; count: number; source: string };
 type ScanResult = {
@@ -30,7 +30,7 @@ type ScanResult = {
   project_visibility: ProjectVisibility[];
 };
 
-type BackupInfo = { id: string; path: string };
+type BackupInfo = { id: string; path: string; created_at: string };
 type WorkspaceSyncResult = {
   present: boolean;
   updated: boolean;
@@ -148,6 +148,18 @@ export default function App() {
     await doScan();
   }
 
+  async function doDeleteBackup(id: string) {
+    const confirmed = window.confirm(`确定要删除备份 ${id} 吗？删除后无法从这个备份恢复。`);
+    if (!confirmed) {
+      return;
+    }
+    await run(() =>
+      invoke("delete_backup", { codexHome: path.trim() || null, backupId: id })
+    );
+    setMessage(`备份已删除：${id}`);
+    await refreshBackups();
+  }
+
   async function copyQQGroupNumber() {
     if (!QQ_GROUP_NUMBER_READY) {
       setCopyMessage("请先在源码中填写真实QQ群号");
@@ -162,8 +174,8 @@ export default function App() {
     setCopyMessage("加群链接已复制");
   }
 
-  function joinQQGroup() {
-    window.open(QQ_GROUP_JOIN_URL, "_blank", "noopener,noreferrer");
+  async function joinQQGroup() {
+    await run(() => invoke("open_external_url", { url: QQ_GROUP_JOIN_URL }));
   }
 
   return (
@@ -287,19 +299,24 @@ export default function App() {
           <thead>
             <tr>
               <th style={th}>ID</th>
+              <th style={th}>备份日期</th>
               <th style={th}>路径</th>
               <th style={th}>操作</th>
             </tr>
           </thead>
           <tbody>
             {backups.length === 0 ? (
-              <tr><td style={td} colSpan={3}>暂无备份</td></tr>
+              <tr><td style={td} colSpan={4}>暂无备份</td></tr>
             ) : backups.map((b) => (
               <tr key={b.id}>
                 <td style={td}>{b.id}</td>
+                <td style={td}>{formatDateTime(b.created_at)}</td>
                 <td style={td}>{b.path}</td>
                 <td style={td}>
-                  <button style={btn} disabled={busy} onClick={() => doRestore(b.id)}>恢复</button>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button style={btn} disabled={busy} onClick={() => doRestore(b.id)}>恢复</button>
+                    <button style={btnDanger} disabled={busy} onClick={() => doDeleteBackup(b.id)}>删除</button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -345,7 +362,7 @@ function StartupNotice({
 
         <div style={groupBox}>
           <div>
-            <div style={{ color: "#1d4ed8", fontSize: 12, fontWeight: 700 }}>宣传 QQ 群</div>
+            <div style={{ color: "#1d4ed8", fontSize: 12, fontWeight: 700 }}>邀请你加入</div>
             <div style={{ marginTop: 6, fontWeight: 700 }}>{QQ_GROUP_NAME}</div>
             <div style={{ marginTop: 4, fontSize: 22, fontWeight: 800 }}>{QQ_GROUP_NUMBER}</div>
             <div style={{ marginTop: 6, color: "#4b5563" }}>反馈问题、获取更新、交流 CCS 与 Codex 配置经验。</div>
@@ -403,6 +420,17 @@ function formatCounts(counts: Record<string, number>) {
   return entries.length === 0 ? "-" : entries.map(([k, v]) => `${k}: ${v}`).join(", ");
 }
 
+function formatDateTime(value: string) {
+  if (!value || value === "-") {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString();
+}
+
 function Card({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section style={{ border: "1px solid #e5e7eb", borderRadius: 14, padding: 18, background: "#fff", marginBottom: 16 }}>
@@ -429,6 +457,7 @@ const input: React.CSSProperties = { width: "100%", padding: "10px 12px", border
 const strategyBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, padding: 14, border: "1px solid #dbeafe", borderRadius: 12, background: "#eff6ff" };
 const btn: React.CSSProperties = { padding: "10px 14px", borderRadius: 8, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" };
 const btnPrimary: React.CSSProperties = { ...btn, background: "#111827", color: "#fff", border: "1px solid #111827" };
+const btnDanger: React.CSSProperties = { ...btn, color: "#b91c1c", border: "1px solid #fecaca", background: "#fef2f2" };
 const modalBackdrop: React.CSSProperties = { position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(15, 23, 42, 0.46)", backdropFilter: "blur(6px)" };
 const modalCard: React.CSSProperties = { width: "min(560px, 100%)", borderRadius: 20, padding: 24, background: "#ffffff", boxShadow: "0 24px 80px rgba(15, 23, 42, 0.28)", border: "1px solid rgba(191, 219, 254, 0.9)" };
 const groupBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginTop: 16, padding: 16, borderRadius: 16, background: "#eff6ff", border: "1px solid #bfdbfe" };
