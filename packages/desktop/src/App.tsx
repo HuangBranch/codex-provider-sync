@@ -5,7 +5,7 @@ const QQ_GROUP_NAME = "Codex Provider Sync 用户交流群";
 const QQ_GROUP_NUMBER = "484630263";
 const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
 const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
-const APP_VERSION = "2.2.2";
+const APP_VERSION = "2.2.3";
 const UPSTREAM_PROJECT_URL = "https://github.com/Dailin521/codex-provider-sync";
 
 type ProviderStat = { provider: string; count: number; source: string };
@@ -142,9 +142,10 @@ export default function App() {
         `同步完成：目标 provider ${data.target_provider}`,
         `rollout ${data.changed_rollout_files} 个`,
         `SQLite ${data.changed_sqlite_rows} 行`,
+        `provider 可见性 ${data.changed_sqlite_provider_rows} 行`,
         `workspace roots ${data.workspace_roots.updated ? "已更新" : "未变化"}`,
         data.protected_encrypted_thread_count > 0
-          ? `保护 ${data.protected_encrypted_thread_count} 个 encrypted 线程未硬改 provider`
+          ? `保护 ${data.protected_encrypted_thread_count} 个 encrypted rollout 未硬改，但已尝试同步 SQLite 可见性`
           : "",
         "config.toml 未修改",
         data.skipped_rollout_files.length > 0 ? `跳过 ${data.skipped_rollout_files.length} 个占用/变化文件` : ""
@@ -280,7 +281,7 @@ export default function App() {
                 </div>
               )}
               <div style={{ marginTop: 6, color: "#4b5563", lineHeight: 1.6 }}>
-                以当前 provider 为准，只同步可安全处理的历史会话、SQLite 线程可见性与 workspace roots；不会修改 API key、自定义 URL 或账号授权。
+                以当前 provider 为准，同步历史会话的 SQLite 线程可见性与 workspace roots；未加密 rollout 会同步 provider，含 encrypted_content 的 rollout 只同步可见性，不硬改会话本体。不会修改 API key、自定义 URL 或账号授权。
               </div>
             </div>
             <label style={{ whiteSpace: "nowrap" }}>

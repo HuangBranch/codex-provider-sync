@@ -49,7 +49,7 @@ struct RolloutCollection {
     locked_paths: Vec<String>,
     user_event_thread_ids: HashSet<String>,
     thread_cwd_by_id: HashMap<String, String>,
-    provider_sync_thread_ids: HashSet<String>,
+    sqlite_provider_thread_ids: HashSet<String>,
     protected_encrypted_paths: Vec<String>,
     protected_encrypted_thread_ids: HashSet<String>,
 }
@@ -380,7 +380,7 @@ fn sync_provider(
         target,
         &rollout.user_event_thread_ids,
         &rollout.thread_cwd_by_id,
-        &rollout.provider_sync_thread_ids,
+        &rollout.sqlite_provider_thread_ids,
     )?;
     let workspace_roots = sync_workspace_roots(&home)?;
 
@@ -707,10 +707,10 @@ fn collect_rollout_metadata(
             }
 
             if let Some(target) = target_provider {
+                if let Some(thread_id) = &thread_id {
+                    out.sqlite_provider_thread_ids.insert(thread_id.clone());
+                }
                 if current_provider == target {
-                    if let Some(thread_id) = &thread_id {
-                        out.provider_sync_thread_ids.insert(thread_id.clone());
-                    }
                 } else if has_encrypted_content {
                     out.protected_encrypted_paths
                         .push(entry.path().display().to_string());
@@ -723,9 +723,6 @@ fn collect_rollout_metadata(
                             "model_provider".to_string(),
                             Value::String(target.to_string()),
                         );
-                        if let Some(thread_id) = &thread_id {
-                            out.provider_sync_thread_ids.insert(thread_id.clone());
-                        }
                         out.changes.push(RolloutChange {
                             path: entry.path().to_path_buf(),
                             original_first_line: record.first_line,
@@ -911,10 +908,10 @@ fn encrypted_counts_to_stats(counts: &ProviderCounts) -> Vec<ProviderStat> {
 
 fn build_encrypted_content_warning(counts: &ProviderCounts, target_provider: &str) -> Option<String> {
     let mut risky = HashSet::new();
-    let mut total = 0u64;
+    let mut risky_total = 0u64;
     for (provider, count) in counts.sessions.iter().chain(counts.archived_sessions.iter()) {
-        total += *count;
         if provider != target_provider && *count > 0 {
+            risky_total += *count;
             risky.insert(provider.clone());
         }
     }
@@ -924,8 +921,8 @@ fn build_encrypted_content_warning(counts: &ProviderCounts, target_provider: &st
     let mut providers: Vec<_> = risky.into_iter().collect();
     providers.sort();
     Some(format!(
-        "{} 个 rollout 文件含 encrypted_content，来自 provider: {}。可见性可以同步到 {}，但继续对话或 compact 仍可能失败。",
-        total,
+        "{} 个 rollout 文件含 encrypted_content，来自 provider: {}。本工具会同步 SQLite 可见性到 {}，但不会强改这些 rollout 文件；继续对话或 compact 仍可能失败。",
+        risky_total,
         providers.join(", "),
         target_provider
     ))
@@ -976,7 +973,7 @@ fn sync_sqlite_session_state(
     target: &str,
     user_event_thread_ids: &HashSet<String>,
     thread_cwd_by_id: &HashMap<String, String>,
-    provider_sync_thread_ids: &HashSet<String>,
+    sqlite_provider_thread_ids: &HashSet<String>,
 ) -> Result<SqliteSyncStats, String> {
     if !path.exists() {
         return Ok(SqliteSyncStats::default());
@@ -997,7 +994,7 @@ fn sync_sqlite_session_state(
                         "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
                     )
                     .map_err(|e| sqlite_err(e, "update SQLite session provider"))?;
-                for thread_id in provider_sync_thread_ids {
+                for thread_id in sqlite_provider_thread_ids {
                     if thread_id.trim().is_empty() {
                         continue;
                     }
