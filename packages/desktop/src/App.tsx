@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+const QQ_GROUP_NAME = "Codex Provider Sync 用户交流群";
+const QQ_GROUP_NUMBER = "484630263";
+const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
+const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
+const APP_VERSION = "0.1.0";
+
 type ProviderStat = { provider: string; count: number; source: string };
 type ScanResult = {
   codex_home: string;
@@ -59,14 +65,15 @@ type ProjectVisibility = {
 
 export default function App() {
   const [path, setPath] = useState("");
-  const [target, setTarget] = useState("openai");
-  const [updateConfig, setUpdateConfig] = useState(true);
   const [autoBackup, setAutoBackup] = useState(true);
+  const [showStartupNotice, setShowStartupNotice] = useState(true);
+  const [copyMessage, setCopyMessage] = useState("");
   const [scan, setScan] = useState<ScanResult | null>(null);
   const [backups, setBackups] = useState<BackupInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const canSync = Boolean(scan && scan.config_exists && scan.current_provider);
 
   useEffect(() => {
     void refreshBackups();
@@ -107,17 +114,16 @@ export default function App() {
     const data = await run(() =>
       invoke<SyncResult>("sync_provider", {
         codexHome: path.trim() || null,
-        targetProvider: target,
-        updateConfig,
         autoBackup
       })
     );
     setMessage(
       [
-        `同步完成：rollout ${data.changed_rollout_files} 个`,
+        `同步完成：目标 provider ${data.target_provider}`,
+        `rollout ${data.changed_rollout_files} 个`,
         `SQLite ${data.changed_sqlite_rows} 行`,
         `workspace roots ${data.workspace_roots.updated ? "已更新" : "未变化"}`,
-        `config ${data.changed_config ? "已修改" : "未修改"}`,
+        "config.toml 未修改",
         data.skipped_rollout_files.length > 0 ? `跳过 ${data.skipped_rollout_files.length} 个占用/变化文件` : ""
       ].filter(Boolean).join("，")
     );
@@ -142,14 +148,42 @@ export default function App() {
     await doScan();
   }
 
+  async function copyQQGroupNumber() {
+    if (!QQ_GROUP_NUMBER_READY) {
+      setCopyMessage("请先在源码中填写真实QQ群号");
+      return;
+    }
+    await navigator.clipboard.writeText(QQ_GROUP_NUMBER);
+    setCopyMessage("QQ群号已复制");
+  }
+
+  async function copyQQJoinUrl() {
+    await navigator.clipboard.writeText(QQ_GROUP_JOIN_URL);
+    setCopyMessage("加群链接已复制");
+  }
+
+  function joinQQGroup() {
+    window.open(QQ_GROUP_JOIN_URL, "_blank", "noopener,noreferrer");
+  }
+
   return (
     <div style={wrap}>
+      {showStartupNotice && (
+        <StartupNotice
+          copyMessage={copyMessage}
+          onCopyGroupNumber={copyQQGroupNumber}
+          onCopyJoinUrl={copyQQJoinUrl}
+          onJoinGroup={joinQQGroup}
+          onClose={() => setShowStartupNotice(false)}
+        />
+      )}
+
       <h1 style={{ marginBottom: 6 }}>Codex Provider Sync Full</h1>
       <p style={{ color: "#4b5563", marginTop: 0 }}>
         扫描、本地 provider 同步、自动备份、恢复，一套打通。
       </p>
 
-      <Card title="路径与目标">
+      <Card title="路径与同步策略">
         <div style={{ display: "grid", gap: 12 }}>
           <input
             value={path}
@@ -157,22 +191,24 @@ export default function App() {
             placeholder="留空自动用 ~/.codex，或手动输入完整路径"
             style={input}
           />
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <input
-              value={target}
-              onChange={(e) => setTarget(e.target.value)}
-              placeholder="目标 provider，如 openai / relay"
-              style={input}
-            />
-            <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-              <label><input type="checkbox" checked={updateConfig} onChange={(e) => setUpdateConfig(e.target.checked)} /> 同步改 config.toml</label>
-              <label><input type="checkbox" checked={autoBackup} onChange={(e) => setAutoBackup(e.target.checked)} /> 执行前自动备份</label>
+          <div style={strategyBox}>
+            <div>
+              <div style={{ color: "#6b7280", fontSize: 12 }}>同步目标</div>
+              <div style={{ marginTop: 6, fontWeight: 700 }}>
+                当前 config.toml provider：{scan?.current_provider || "请先扫描"}
+              </div>
+              <div style={{ marginTop: 6, color: "#4b5563", lineHeight: 1.6 }}>
+                以当前配置为准，只同步历史会话、SQLite 与 workspace roots；不会修改 config.toml、自定义 URL、key 或 CCS 管理的账号配置。
+              </div>
             </div>
+            <label style={{ whiteSpace: "nowrap" }}>
+              <input type="checkbox" checked={autoBackup} onChange={(e) => setAutoBackup(e.target.checked)} /> 执行前自动备份
+            </label>
           </div>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
             <button style={btn} disabled={busy} onClick={doScan}>扫描</button>
             <button style={btn} disabled={busy} onClick={doBackup}>立即备份</button>
-            <button style={btnPrimary} disabled={busy} onClick={doSync}>执行同步</button>
+            <button style={btnPrimary} disabled={busy || !canSync} onClick={doSync}>执行同步</button>
           </div>
         </div>
       </Card>
@@ -274,6 +310,61 @@ export default function App() {
   );
 }
 
+function StartupNotice({
+  copyMessage,
+  onCopyGroupNumber,
+  onCopyJoinUrl,
+  onJoinGroup,
+  onClose
+}: {
+  copyMessage: string;
+  onCopyGroupNumber: () => void;
+  onCopyJoinUrl: () => void;
+  onJoinGroup: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div style={modalBackdrop} role="dialog" aria-modal="true" aria-labelledby="startup-notice-title">
+      <div style={modalCard}>
+        <div style={{ color: "#1d4ed8", fontSize: 13, fontWeight: 700, letterSpacing: 0.4 }}>启动说明</div>
+        <h2 id="startup-notice-title" style={{ margin: "8px 0 10px" }}>Codex Provider Sync v{APP_VERSION}</h2>
+
+        <div style={noticePanel}>
+          <div style={noticeLabel}>版本信息</div>
+          <div style={{ fontWeight: 700 }}>当前版本：v{APP_VERSION}</div>
+          <div style={{ marginTop: 6, color: "#4b5563" }}>桌面版支持 macOS 与 Windows，用于修复 Codex 历史会话 provider 元数据。</div>
+        </div>
+
+        <div style={noticePanel}>
+          <div style={noticeLabel}>说明</div>
+          <div style={{ color: "#374151", lineHeight: 1.7 }}>
+            如果你使用 CCS 切换账号/provider，请先在 CCS 中切好当前账号。本工具以当前 config.toml
+            根级 model_provider 为同步目标，不修改 config.toml、自定义 URL、API key 或 auth 配置。
+          </div>
+        </div>
+
+        <div style={groupBox}>
+          <div>
+            <div style={{ color: "#1d4ed8", fontSize: 12, fontWeight: 700 }}>宣传 QQ 群</div>
+            <div style={{ marginTop: 6, fontWeight: 700 }}>{QQ_GROUP_NAME}</div>
+            <div style={{ marginTop: 4, fontSize: 22, fontWeight: 800 }}>{QQ_GROUP_NUMBER}</div>
+            <div style={{ marginTop: 6, color: "#4b5563" }}>反馈问题、获取更新、交流 CCS 与 Codex 配置经验。</div>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <button style={btn} disabled={!QQ_GROUP_NUMBER_READY} onClick={onCopyGroupNumber}>复制群号</button>
+            <button style={btn} onClick={onCopyJoinUrl}>复制链接</button>
+          </div>
+        </div>
+        {copyMessage && <div style={{ marginTop: 10, color: "#166534", fontWeight: 600 }}>{copyMessage}</div>}
+        <div style={modalActions}>
+          <button style={btn} onClick={onClose}>关闭</button>
+          <button style={btnPrimary} onClick={onJoinGroup}>加入交流群</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ProviderTable({ rows, empty }: { rows: ProviderStat[]; empty: string }) {
   return (
     <table style={table}>
@@ -335,8 +426,15 @@ function Grid({ children }: { children: React.ReactNode }) {
 
 const wrap: React.CSSProperties = { maxWidth: 1100, margin: "28px auto", padding: 20, fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', color: "#111827", background: "#f8fafc" };
 const input: React.CSSProperties = { width: "100%", padding: "10px 12px", border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, boxSizing: "border-box" };
+const strategyBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, padding: 14, border: "1px solid #dbeafe", borderRadius: 12, background: "#eff6ff" };
 const btn: React.CSSProperties = { padding: "10px 14px", borderRadius: 8, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" };
 const btnPrimary: React.CSSProperties = { ...btn, background: "#111827", color: "#fff", border: "1px solid #111827" };
+const modalBackdrop: React.CSSProperties = { position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(15, 23, 42, 0.46)", backdropFilter: "blur(6px)" };
+const modalCard: React.CSSProperties = { width: "min(560px, 100%)", borderRadius: 20, padding: 24, background: "#ffffff", boxShadow: "0 24px 80px rgba(15, 23, 42, 0.28)", border: "1px solid rgba(191, 219, 254, 0.9)" };
+const groupBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginTop: 16, padding: 16, borderRadius: 16, background: "#eff6ff", border: "1px solid #bfdbfe" };
+const noticePanel: React.CSSProperties = { marginTop: 14, padding: 14, borderRadius: 14, background: "#f9fafb", border: "1px solid #eef2f7" };
+const noticeLabel: React.CSSProperties = { marginBottom: 6, color: "#6b7280", fontSize: 12, fontWeight: 700 };
+const modalActions: React.CSSProperties = { display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 };
 const table: React.CSSProperties = { width: "100%", borderCollapse: "collapse", fontSize: 14 };
 const th: React.CSSProperties = { textAlign: "left", padding: 10, borderBottom: "1px solid #e5e7eb", background: "#f9fafb" };
 const td: React.CSSProperties = { padding: 10, borderBottom: "1px solid #f3f4f6", verticalAlign: "top" };

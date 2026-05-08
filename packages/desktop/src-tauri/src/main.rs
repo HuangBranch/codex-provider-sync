@@ -9,10 +9,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use toml_edit::{value, DocumentMut};
 use walkdir::WalkDir;
 
-const DEFAULT_PROVIDER: &str = "openai";
 const DB_FILE: &str = "state_5.sqlite";
 const GLOBAL_STATE_FILE: &str = ".codex-global-state.json";
 const GLOBAL_STATE_BACKUP_FILE: &str = ".codex-global-state.json.bak";
@@ -235,14 +233,17 @@ fn restore_backup(codex_home: Option<String>, backup_id: String) -> Result<(), S
 #[tauri::command]
 fn sync_provider(
     codex_home: Option<String>,
-    target_provider: String,
-    update_config: bool,
     auto_backup: bool,
 ) -> Result<SyncResult, String> {
     let home = resolve_codex_home(codex_home)?;
+    let config_toml = home.join("config.toml");
+    if !config_toml.exists() {
+        return Err("找不到 config.toml，无法确定当前 provider。请先用 Codex/CCS 配置好账号后再同步。".to_string());
+    }
+    let (target_provider, _) = read_config_info(&config_toml);
     let target = target_provider.trim();
     if target.is_empty() {
-        return Err("target_provider 不能为空".to_string());
+        return Err("config.toml 中没有读取到根级 model_provider，无法确定同步目标。请先用 CCS 切换到目标账号/provider。".to_string());
     }
 
     let rollout = collect_rollout_metadata(&home, Some(target))?;
@@ -263,11 +264,6 @@ fn sync_provider(
         &rollout.thread_cwd_by_id,
     )?;
     let workspace_roots = sync_workspace_roots(&home)?;
-    let changed_config = if update_config {
-        sync_config_toml(&home.join("config.toml"), target)?
-    } else {
-        false
-    };
 
     Ok(SyncResult {
         backup_id: backup,
@@ -280,7 +276,7 @@ fn sync_provider(
         changed_sqlite_generic_rows: sqlite_stats.generic_provider_rows,
         changed_sqlite_user_event_rows: sqlite_stats.user_event_rows,
         changed_sqlite_cwd_rows: sqlite_stats.cwd_rows,
-        changed_config,
+        changed_config: false,
         workspace_roots,
         encrypted_content_warning,
     })
@@ -1006,8 +1002,8 @@ fn sqlite_provider_columns_tx(tx: &rusqlite::Transaction<'_>, table: &str) -> Re
 
 fn read_config_info(path: &Path) -> (String, Vec<String>) {
     let text = fs::read_to_string(path).unwrap_or_default();
-    let mut current = DEFAULT_PROVIDER.to_string();
-    let mut configured = HashSet::from([DEFAULT_PROVIDER.to_string()]);
+    let mut current = String::new();
+    let mut configured = HashSet::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1038,21 +1034,6 @@ fn read_config_info(path: &Path) -> (String, Vec<String>) {
     let mut configured: Vec<_> = configured.into_iter().collect();
     configured.sort();
     (current, configured)
-}
-
-fn sync_config_toml(path: &Path, target: &str) -> Result<bool, String> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let text = fs::read_to_string(path).map_err(to_err)?;
-    let mut doc = text.parse::<DocumentMut>().map_err(to_err)?;
-    let current = doc.get("model_provider").and_then(|v| v.as_str()).unwrap_or("");
-    if current == target {
-        return Ok(false);
-    }
-    doc["model_provider"] = value(target);
-    fs::write(path, doc.to_string()).map_err(to_err)?;
-    Ok(true)
 }
 
 fn read_project_visibility(home: &Path) -> Result<Vec<ProjectVisibility>, String> {
