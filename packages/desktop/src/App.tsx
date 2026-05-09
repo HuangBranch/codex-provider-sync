@@ -5,7 +5,7 @@ const QQ_GROUP_NAME = "Codex Provider Sync 用户交流群";
 const QQ_GROUP_NUMBER = "484630263";
 const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
 const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
-const APP_VERSION = "2.2.5";
+const APP_VERSION = "2.2.6";
 const UPSTREAM_PROJECT_URL = "https://github.com/Dailin521/codex-provider-sync";
 
 type ProviderStat = { provider: string; count: number; source: string };
@@ -86,11 +86,17 @@ type ProjectVisibility = {
   provider_counts: Record<string, number>;
 };
 type NoticeKind = "success" | "error" | "warning" | "info";
+type NoticeAction = {
+  id: "repair-provider-conflict";
+  label: string;
+  variant?: "primary" | "danger";
+};
 type NoticeState = {
   kind: NoticeKind;
   title: string;
   body: string;
   details?: string[];
+  action?: NoticeAction;
 };
 
 export default function App() {
@@ -103,8 +109,6 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState<BackupInfo | null>(null);
   const [showClearToolDataDialog, setShowClearToolDataDialog] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
-  const [error, setError] = useState("");
   const [notice, setNotice] = useState<NoticeState | null>(null);
   const hasProviderConflict = Boolean(scan?.reserved_provider_conflicts.length);
   const codexIsRunning = Boolean(scan?.running_codex_processes.length);
@@ -113,18 +117,12 @@ export default function App() {
     void refreshBackups();
   }, []);
 
-  async function run<T>(fn: () => Promise<T>, options: { resetStatus?: boolean } = {}) {
-    const resetStatus = options.resetStatus ?? true;
+  async function run<T>(fn: () => Promise<T>) {
     setBusy(true);
-    if (resetStatus) {
-      setError("");
-      setMessage("");
-    }
     try {
       return await fn();
     } catch (e) {
       const body = normalizeError(e);
-      setError(body);
       showNotice("error", "操作失败", body);
       throw e;
     } finally {
@@ -132,14 +130,13 @@ export default function App() {
     }
   }
 
-  async function doScan(options: { silent?: boolean; preserveStatus?: boolean } = {}) {
+  async function doScan(options: { silent?: boolean } = {}) {
     const data = await run(() =>
       invoke<ScanResult>("scan_codex_home", { codexHome: path.trim() || null })
-    , { resetStatus: !options.preserveStatus });
+    );
     setScan(data);
     if (!options.silent) {
-      setMessage("扫描完成");
-      showNotice("success", "扫描完成", buildScanSummary(data), buildScanDetails(data));
+      showScanNotice(data);
     }
     await refreshBackups();
     return data;
@@ -153,7 +150,6 @@ export default function App() {
       invoke<BackupInfo>("create_backup", { codexHome: path.trim() || null })
     );
     const body = `备份完成：${data.id}`;
-    setMessage(body);
     showNotice("success", "备份完成", body, [`路径：${data.path}`]);
     await refreshBackups();
   }
@@ -168,24 +164,7 @@ export default function App() {
         autoBackup
       })
     );
-    setMessage(
-      [
-        `同步完成：目标 provider ${data.target_provider}`,
-        `rollout ${data.changed_rollout_files} 个`,
-        `SQLite ${data.changed_sqlite_rows} 行`,
-        `provider 可见性 ${data.changed_sqlite_provider_rows} 行（按上游策略全量同步）`,
-        `workspace roots ${data.workspace_roots.updated ? "已更新" : "未变化"}`,
-        data.encrypted_thread_count > 0
-          ? `检测到 ${data.encrypted_thread_count} 个 encrypted rollout，未改消息密文本体`
-          : "",
-        "config.toml 未修改",
-        data.skipped_rollout_files.length > 0 ? `跳过 ${data.skipped_rollout_files.length} 个占用/变化文件` : ""
-      ].filter(Boolean).join("，")
-    );
-    if (data.encrypted_content_warning) {
-      setError(data.encrypted_content_warning);
-    }
-    await doScan({ silent: true, preserveStatus: true });
+    await doScan({ silent: true });
     showNotice(
       "success",
       "同步完成",
@@ -213,9 +192,8 @@ export default function App() {
     );
     const renamed = data.renamed_providers.map((item) => `${item.from} -> ${item.to}`).join("，");
     const body = `已修复 provider 命名冲突：${renamed}`;
-    setMessage(`${body}。原 config.toml 已备份到 ${data.backup_path}`);
     showNotice("success", "修复完成", body, [`备份：${data.backup_path}`]);
-    await doScan({ silent: true, preserveStatus: true });
+    await doScan({ silent: true });
   }
 
   async function refreshBackups() {
@@ -233,9 +211,8 @@ export default function App() {
       invoke("restore_backup", { codexHome: path.trim() || null, backupId: id })
     );
     const body = `恢复完成：${id}`;
-    setMessage(body);
     showNotice("success", "恢复完成", body);
-    await doScan({ silent: true, preserveStatus: true });
+    await doScan({ silent: true });
   }
 
   async function doDeleteBackup() {
@@ -248,7 +225,6 @@ export default function App() {
     );
     setDeleteTarget(null);
     const body = `备份已删除：${id}`;
-    setMessage(body);
     showNotice("success", "删除完成", body);
     await refreshBackups();
   }
@@ -259,11 +235,6 @@ export default function App() {
     );
     setShowClearToolDataDialog(false);
     setBackups([]);
-    setMessage(
-      data.removed_paths.length > 0
-        ? `本工具数据已清理：${data.removed_paths.length} 个目录`
-        : "没有发现需要清理的本工具数据"
-    );
     showNotice(
       "success",
       "清理完成",
@@ -274,8 +245,43 @@ export default function App() {
     );
   }
 
-  function showNotice(kind: NoticeKind, title: string, body: string, details: string[] = []) {
-    setNotice({ kind, title, body, details });
+  function showNotice(
+    kind: NoticeKind,
+    title: string,
+    body: string,
+    details: string[] = [],
+    action?: NoticeAction
+  ) {
+    setNotice({ kind, title, body, details, action });
+  }
+
+  function showScanNotice(data: ScanResult) {
+    if (data.reserved_provider_conflicts.length > 0) {
+      showNotice(
+        "warning",
+        "发现 provider 命名冲突",
+        "这就是 Codex 里出现“Invalid configuration: model_providers contains reserved built-in provider IDs: openai”的原因。请先完全退出 Codex，然后用本工具备份并把自定义 provider 改名为 openai-custom。",
+        buildScanDetails(data),
+        { id: "repair-provider-conflict", label: "备份并修复", variant: "danger" }
+      );
+      return;
+    }
+    if (data.running_codex_processes.length > 0) {
+      showNotice(
+        "warning",
+        "扫描完成，但请先退出 Codex",
+        buildScanSummary(data),
+        buildScanDetails(data)
+      );
+      return;
+    }
+    showNotice("success", "扫描完成", buildScanSummary(data), buildScanDetails(data));
+  }
+
+  function handleNoticeAction(action: NoticeAction) {
+    if (action.id === "repair-provider-conflict") {
+      void doRepairProviderConflicts();
+    }
   }
 
   function ensureSyncReady() {
@@ -353,7 +359,9 @@ export default function App() {
       {notice && (
         <NoticeDialog
           notice={notice}
+          busy={busy}
           onClose={() => setNotice(null)}
+          onAction={handleNoticeAction}
         />
       )}
 
@@ -410,37 +418,14 @@ export default function App() {
             <button style={btn} disabled={busy} onClick={() => doScan()}>扫描</button>
             <button style={btn} disabled={busy} onClick={doBackup}>立即备份</button>
             <button style={btnPrimary} disabled={busy} onClick={doSync}>执行同步</button>
+            {hasProviderConflict && (
+              <button style={btnDanger} disabled={busy} onClick={doRepairProviderConflicts}>
+                修复 provider 冲突
+              </button>
+            )}
           </div>
-          {codexIsRunning && (
-            <div style={dangerPanel}>
-              <div style={{ fontWeight: 800 }}>请先完全退出 Codex</div>
-              <div style={{ marginTop: 6, lineHeight: 1.7 }}>
-                当前检测到 Codex / app-server 正在运行。为避免 Codex 退出时覆盖 state_5.sqlite 或归档/删除后续记录，本工具会阻止同步和恢复。
-              </div>
-              <div style={{ marginTop: 10 }}>
-                <List items={scan?.running_codex_processes.map((item) => `${item.name} (${item.pid})`) || []} />
-              </div>
-            </div>
-          )}
-          {hasProviderConflict && (
-            <div style={dangerPanel}>
-              <div style={{ fontWeight: 800 }}>发现 Codex 保留 provider 名冲突</div>
-              <div style={{ marginTop: 6, lineHeight: 1.7 }}>
-                当前 config.toml 里存在 {scan?.reserved_provider_conflicts.map((id) => `[model_providers.${id}]`).join("，")}。
-                Codex 官方内置 provider 名不能被自定义 provider 覆盖，否则会出现“Invalid configuration: reserved built-in provider IDs”的报错。
-              </div>
-              <div style={{ marginTop: 12 }}>
-                <button style={btnDanger} disabled={busy} onClick={doRepairProviderConflicts}>
-                  备份并改名为 openai-custom
-                </button>
-              </div>
-            </div>
-          )}
         </div>
       </Card>
-
-      {message && <Alert color="#166534" bg="#f0fdf4" border="#bbf7d0">{message}</Alert>}
-      {error && <Alert color="#b91c1c" bg="#fef2f2" border="#fecaca">{error}</Alert>}
 
       {scan && (
         <Card title="扫描结果">
@@ -483,14 +468,6 @@ export default function App() {
               }
             />
           </Grid>
-          {scan.config_warnings.length > 0 && (
-            <div style={{ marginTop: 18 }}>
-              <Alert color="#92400e" bg="#fffbeb" border="#fde68a">
-                <div style={{ fontWeight: 800, marginBottom: 6 }}>配置提醒</div>
-                <List items={scan.config_warnings} />
-              </Alert>
-            </div>
-          )}
           <h3 style={{ marginTop: 18 }}>Provider 分布</h3>
           <ProviderTable rows={scan.provider_stats} empty="未发现 provider 相关字段" />
 
@@ -644,10 +621,14 @@ function StartupNotice({
 
 function NoticeDialog({
   notice,
-  onClose
+  busy,
+  onClose,
+  onAction
 }: {
   notice: NoticeState;
+  busy: boolean;
   onClose: () => void;
+  onAction: (action: NoticeAction) => void;
 }) {
   const tone = noticeTone[notice.kind];
 
@@ -665,6 +646,15 @@ function NoticeDialog({
           </div>
         )}
         <div style={modalActions}>
+          {notice.action && (
+            <button
+              style={notice.action.variant === "danger" ? btnDanger : btnPrimary}
+              disabled={busy}
+              onClick={() => onAction(notice.action!)}
+            >
+              {notice.action.label}
+            </button>
+          )}
           <button style={notice.kind === "error" ? btnDanger : btnPrimary} onClick={onClose}>知道了</button>
         </div>
       </div>
@@ -850,10 +840,6 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
   );
 }
 
-function Alert({ children, color, bg, border }: { children: React.ReactNode; color: string; bg: string; border: string }) {
-  return <div style={{ marginBottom: 16, padding: 12, color, background: bg, border: `1px solid ${border}`, borderRadius: 10 }}>{children}</div>;
-}
-
 function KV({ k, v }: { k: string; v: string }) {
   return <div style={{ padding: 12, border: "1px solid #eef2f7", borderRadius: 10 }}><div style={{ color: "#6b7280", fontSize: 12 }}>{k}</div><div style={{ marginTop: 6, fontWeight: 600 }}>{v}</div></div>;
 }
@@ -865,7 +851,6 @@ function Grid({ children }: { children: React.ReactNode }) {
 const wrap: React.CSSProperties = { maxWidth: 1100, margin: "28px auto", padding: 20, fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', color: "#111827", background: "#f8fafc" };
 const input: React.CSSProperties = { width: "100%", padding: "10px 12px", border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, boxSizing: "border-box" };
 const strategyBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, padding: 14, border: "1px solid #dbeafe", borderRadius: 12, background: "#eff6ff" };
-const dangerPanel: React.CSSProperties = { padding: 14, borderRadius: 12, border: "1px solid #fecaca", background: "#fef2f2", color: "#7f1d1d" };
 const btn: React.CSSProperties = { padding: "10px 14px", borderRadius: 8, border: "1px solid #d1d5db", background: "#fff", cursor: "pointer" };
 const btnPrimary: React.CSSProperties = { ...btn, background: "#111827", color: "#fff", border: "1px solid #111827" };
 const btnDanger: React.CSSProperties = { ...btn, color: "#b91c1c", border: "1px solid #fecaca", background: "#fef2f2" };
