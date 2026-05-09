@@ -1,14 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use chrono::Local;
+use filetime::{set_file_mtime, FileTime};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -18,6 +19,8 @@ const GLOBAL_STATE_BACKUP_FILE: &str = ".codex-global-state.json.bak";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const DEFAULT_BUILTIN_PROVIDER: &str = "openai";
 const RESERVED_BUILTIN_PROVIDER_IDS: [&str; 1] = ["openai"];
+const SYNC_LOCK_DIR: &str = "provider-sync.lock";
+const SCAN_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[derive(Serialize, Clone)]
 struct ProviderStat {
@@ -49,7 +52,6 @@ struct RolloutCollection {
     locked_paths: Vec<String>,
     user_event_thread_ids: HashSet<String>,
     thread_cwd_by_id: HashMap<String, String>,
-    sqlite_provider_thread_ids: HashSet<String>,
     protected_encrypted_paths: Vec<String>,
     protected_encrypted_thread_ids: HashSet<String>,
 }
@@ -58,6 +60,9 @@ struct RolloutChange {
     path: PathBuf,
     original_first_line: String,
     original_separator: String,
+    original_offset: u64,
+    original_file_len: u64,
+    original_mtime: FileTime,
     updated_first_line: String,
 }
 
@@ -88,6 +93,13 @@ struct ScanResult {
     thread_cwd_count: u64,
     sqlite_repair_stats: Option<SqliteRepairStats>,
     project_visibility: Vec<ProjectVisibility>,
+    running_codex_processes: Vec<RunningCodexProcess>,
+}
+
+#[derive(Serialize)]
+struct RunningCodexProcess {
+    pid: u32,
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -142,14 +154,13 @@ struct SqliteRepairStats {
 #[derive(Default)]
 struct SqliteSyncStats {
     provider_rows: u64,
-    generic_provider_rows: u64,
     user_event_rows: u64,
     cwd_rows: u64,
 }
 
 impl SqliteSyncStats {
     fn total(&self) -> u64 {
-        self.provider_rows + self.generic_provider_rows + self.user_event_rows + self.cwd_rows
+        self.provider_rows + self.user_event_rows + self.cwd_rows
     }
 }
 
@@ -229,12 +240,15 @@ fn scan_codex_home(codex_home: Option<String>) -> Result<ScanResult, String> {
         thread_cwd_count: rollout.thread_cwd_by_id.len() as u64,
         sqlite_repair_stats,
         project_visibility,
+        running_codex_processes: detect_running_codex_processes(),
     })
 }
 
 #[tauri::command]
 fn create_backup(codex_home: Option<String>) -> Result<BackupInfo, String> {
     let home = resolve_codex_home(codex_home)?;
+    assert_codex_not_running_for_write()?;
+    let _lock = SyncLock::acquire(&home, "backup")?;
     create_backup_internal(&home)
 }
 
@@ -251,6 +265,8 @@ fn list_backups(codex_home: Option<String>) -> Result<Vec<BackupInfo>, String> {
 #[tauri::command]
 fn restore_backup(codex_home: Option<String>, backup_id: String) -> Result<(), String> {
     let home = resolve_codex_home(codex_home)?;
+    assert_codex_not_running_for_write()?;
+    let _lock = SyncLock::acquire(&home, "restore")?;
     let backup_dir = find_backup_dir(&home, &backup_id)
         .ok_or_else(|| format!("备份不存在: {}", backup_id))?;
 
@@ -296,6 +312,8 @@ fn clear_tool_data(codex_home: Option<String>) -> Result<ClearToolDataResult, St
 #[tauri::command]
 fn repair_reserved_provider_conflicts(codex_home: Option<String>) -> Result<ConfigRepairResult, String> {
     let home = resolve_codex_home(codex_home)?;
+    assert_codex_not_running_for_write()?;
+    let _lock = SyncLock::acquire(&home, "repair-config")?;
     let config_toml = home.join("config.toml");
     if !config_toml.exists() {
         return Err("找不到 config.toml，无法修复 provider 命名冲突。".to_string());
@@ -348,6 +366,8 @@ fn sync_provider(
     auto_backup: bool,
 ) -> Result<SyncResult, String> {
     let home = resolve_codex_home(codex_home)?;
+    assert_codex_not_running_for_write()?;
+    let _lock = SyncLock::acquire(&home, "sync")?;
     let config_toml = home.join("config.toml");
     if !config_toml.exists() {
         return Err("找不到 config.toml，无法确定当前 provider。请先用 Codex/CCS 配置好账号后再同步。".to_string());
@@ -380,7 +400,6 @@ fn sync_provider(
         target,
         &rollout.user_event_thread_ids,
         &rollout.thread_cwd_by_id,
-        &rollout.sqlite_provider_thread_ids,
     )?;
     let workspace_roots = sync_workspace_roots(&home)?;
 
@@ -392,7 +411,7 @@ fn sync_provider(
         skipped_rollout_files: apply_result.skipped_paths,
         changed_sqlite_rows: sqlite_stats.total(),
         changed_sqlite_provider_rows: sqlite_stats.provider_rows,
-        changed_sqlite_generic_rows: sqlite_stats.generic_provider_rows,
+        changed_sqlite_generic_rows: 0,
         changed_sqlite_user_event_rows: sqlite_stats.user_event_rows,
         changed_sqlite_cwd_rows: sqlite_stats.cwd_rows,
         changed_config: false,
@@ -447,6 +466,192 @@ fn resolve_codex_home(input: Option<String>) -> Result<PathBuf, String> {
             .map(|p| p.join(".codex"))
             .ok_or("无法自动解析当前用户目录".to_string()),
     }
+}
+
+struct SyncLock {
+    path: PathBuf,
+}
+
+impl SyncLock {
+    fn acquire(home: &Path, label: &str) -> Result<Self, String> {
+        let lock_dir = home.join("tmp").join(SYNC_LOCK_DIR);
+        if let Some(parent) = lock_dir.parent() {
+            fs::create_dir_all(parent).map_err(to_err)?;
+        }
+        match fs::create_dir(&lock_dir) {
+            Ok(()) => {
+                let owner = format!(
+                    "{{\n  \"pid\": {},\n  \"label\": \"{}\",\n  \"createdAt\": \"{}\"\n}}\n",
+                    process::id(),
+                    escape_json_string(label),
+                    Local::now().to_rfc3339()
+                );
+                fs::write(lock_dir.join("owner.json"), owner).map_err(to_err)?;
+                Ok(Self { path: lock_dir })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+                "检测到已有同步锁：{}。请确认没有另一个 Codex Provider Sync 正在运行；如果上次异常退出且你确定没有同步任务，再手动删除这个锁目录后重试。",
+                lock_dir.display()
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+impl Drop for SyncLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn assert_codex_not_running_for_write() -> Result<(), String> {
+    let processes = detect_running_codex_processes();
+    if processes.is_empty() {
+        return Ok(());
+    }
+    let preview = processes
+        .iter()
+        .take(5)
+        .map(|item| format!("{}({})", item.name, item.pid))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if processes.len() > 5 {
+        format!(" 等 {} 个进程", processes.len())
+    } else {
+        String::new()
+    };
+    Err(format!(
+        "为避免 Codex 退出时覆盖 state_5.sqlite 或归档/删除后续记录，请先完全退出 Codex / Codex App / app-server 后再同步或恢复。当前检测到：{}{}。",
+        preview, suffix
+    ))
+}
+
+fn detect_running_codex_processes() -> Vec<RunningCodexProcess> {
+    #[cfg(target_os = "windows")]
+    {
+        detect_running_codex_processes_windows()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        detect_running_codex_processes_unix()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_running_codex_processes_unix() -> Vec<RunningCodexProcess> {
+    let output = Command::new("ps")
+        .args(["ax", "-o", "pid=", "-o", "args="])
+        .output();
+    let Ok(output) = output else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = vec![];
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(split_at) = trimmed.find(char::is_whitespace) else {
+            continue;
+        };
+        let pid_text = &trimmed[..split_at];
+        let args = trimmed[split_at..].trim();
+        let Ok(pid) = pid_text.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid == process::id() || !looks_like_codex_runtime(args) {
+            continue;
+        }
+        out.push(RunningCodexProcess {
+            pid,
+            name: simplify_process_name(args),
+        });
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn detect_running_codex_processes_windows() -> Vec<RunningCodexProcess> {
+    let output = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output();
+    let Ok(output) = output else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = vec![];
+    for line in text.lines() {
+        let fields = parse_csv_line(line);
+        if fields.len() < 2 {
+            continue;
+        }
+        let name = fields[0].clone();
+        let Ok(pid) = fields[1].parse::<u32>() else {
+            continue;
+        };
+        if pid == process::id() || !looks_like_codex_runtime(&name) {
+            continue;
+        }
+        out.push(RunningCodexProcess { pid, name });
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = vec![];
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(current.clone());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+fn looks_like_codex_runtime(args: &str) -> bool {
+    let lower = args.to_lowercase();
+    if lower.contains("codex provider sync")
+        || lower.contains("codex_provider_sync")
+        || lower.contains("codex-provider-sync")
+    {
+        return false;
+    }
+    lower.contains("/codex.app/")
+        || lower.contains("\\codex.app\\")
+        || lower.contains("codex app-server")
+        || lower == "codex.exe"
+        || lower == "codex helper.exe"
+        || lower.contains("\\codex.exe")
+        || lower.contains("\\codex helper")
+}
+
+fn simplify_process_name(args: &str) -> String {
+    let trimmed = args.trim();
+    if let Some(first) = trimmed.split_whitespace().next() {
+        if first.contains("Codex.app") {
+            return "Codex.app".to_string();
+        }
+        if trimmed.to_lowercase().contains("app-server") {
+            return "codex app-server".to_string();
+        }
+        return first
+            .rsplit(|ch| ch == '/' || ch == '\\')
+            .next()
+            .unwrap_or(first)
+            .to_string();
+    }
+    trimmed.to_string()
 }
 
 fn backups_root(home: &Path) -> PathBuf {
@@ -662,7 +867,9 @@ fn collect_rollout_metadata(
             if !entry.path().is_file() || !is_rollout_file(entry.path()) {
                 continue;
             }
-            let content = match fs::read_to_string(entry.path()) {
+            let metadata = fs::metadata(entry.path()).map_err(to_err)?;
+            let original_mtime = FileTime::from_last_modification_time(&metadata);
+            let record = match read_first_line_record(entry.path()) {
                 Ok(v) => v,
                 Err(error) if is_file_busy_error(&error) => {
                     out.locked_paths.push(entry.path().display().to_string());
@@ -670,7 +877,6 @@ fn collect_rollout_metadata(
                 }
                 Err(error) => return Err(error.to_string()),
             };
-            let record = split_first_line(&content);
             let mut parsed = match serde_json::from_str::<Value>(&record.first_line) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -686,7 +892,19 @@ fn collect_rollout_metadata(
                 .unwrap_or("(missing)")
                 .to_string();
             let thread_id = session_meta_id(&parsed);
-            let has_encrypted_content = content.contains("encrypted_content");
+            let has_encrypted_content = match file_contains_text_from(
+                entry.path(),
+                b"encrypted_content",
+                record.rest_start as u64,
+                Some(&record.first_line),
+            ) {
+                Ok(v) => v,
+                Err(error) if is_file_busy_error(&error) => {
+                    out.locked_paths.push(entry.path().display().to_string());
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             increment_provider_count(&mut out.provider_counts, dir_name, &current_provider);
 
             if let Some((thread_id, cwd)) = session_meta_id_and_cwd(&parsed) {
@@ -701,15 +919,20 @@ fn collect_rollout_metadata(
                 );
             }
             if let Some(thread_id) = &thread_id {
-                if file_has_user_event(&content) {
-                    out.user_event_thread_ids.insert(thread_id.clone());
+                match file_has_user_event(entry.path(), &record.first_line, record.rest_start as u64) {
+                    Ok(true) => {
+                        out.user_event_thread_ids.insert(thread_id.clone());
+                    }
+                    Ok(false) => {}
+                    Err(error) if is_file_busy_error(&error) => {
+                        out.locked_paths.push(entry.path().display().to_string());
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
                 }
             }
 
             if let Some(target) = target_provider {
-                if let Some(thread_id) = &thread_id {
-                    out.sqlite_provider_thread_ids.insert(thread_id.clone());
-                }
                 if current_provider == target {
                 } else if has_encrypted_content {
                     out.protected_encrypted_paths
@@ -727,6 +950,9 @@ fn collect_rollout_metadata(
                             path: entry.path().to_path_buf(),
                             original_first_line: record.first_line,
                             original_separator: record.separator,
+                            original_offset: record.rest_start as u64,
+                            original_file_len: metadata.len(),
+                            original_mtime,
                             updated_first_line: serde_json::to_string(&parsed).map_err(to_err)?,
                         });
                     }
@@ -748,22 +974,37 @@ fn is_rollout_file(path: &Path) -> bool {
     name.starts_with("rollout-") && name.ends_with(".jsonl")
 }
 
-fn split_first_line(content: &str) -> FirstLineRecord {
-    if let Some(newline_index) = content.find('\n') {
-        let bytes = content.as_bytes();
-        let crlf = newline_index > 0 && bytes[newline_index - 1] == b'\r';
-        let line_end = if crlf { newline_index - 1 } else { newline_index };
-        return FirstLineRecord {
-            first_line: content[..line_end].to_string(),
-            separator: if crlf { "\r\n" } else { "\n" }.to_string(),
-            rest_start: newline_index + 1,
-        };
+fn read_first_line_record(path: &Path) -> Result<FirstLineRecord, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    read_first_line_record_from(&mut file)
+}
+
+fn read_first_line_record_from(file: &mut fs::File) -> Result<FirstLineRecord, std::io::Error> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut collected = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        collected.extend_from_slice(&buffer[..n]);
+        if let Some(newline_index) = collected.iter().position(|byte| *byte == b'\n') {
+            let crlf = newline_index > 0 && collected[newline_index - 1] == b'\r';
+            let line_end = if crlf { newline_index - 1 } else { newline_index };
+            return Ok(FirstLineRecord {
+                first_line: String::from_utf8_lossy(&collected[..line_end]).to_string(),
+                separator: if crlf { "\r\n" } else { "\n" }.to_string(),
+                rest_start: newline_index + 1,
+            });
+        }
     }
-    FirstLineRecord {
-        first_line: content.to_string(),
+    let len = collected.len();
+    Ok(FirstLineRecord {
+        first_line: String::from_utf8_lossy(&collected).to_string(),
         separator: String::new(),
-        rest_start: content.len(),
-    }
+        rest_start: len,
+    })
 }
 
 fn is_session_meta_record(v: &Value) -> bool {
@@ -789,18 +1030,62 @@ fn session_meta_id_and_cwd(v: &Value) -> Option<(String, String)> {
     Some((id.to_string(), cwd.to_string()))
 }
 
-fn file_has_user_event(content: &str) -> bool {
-    for line in BufReader::new(content.as_bytes()).lines().flatten() {
+fn file_contains_text_from(
+    path: &Path,
+    needle: &[u8],
+    start_offset: u64,
+    first_line: Option<&str>,
+) -> Result<bool, std::io::Error> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    if first_line
+        .map(|line| line.as_bytes().windows(needle.len()).any(|window| window == needle))
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut buffer = vec![0u8; SCAN_BUFFER_SIZE];
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        let mut haystack = Vec::with_capacity(tail.len() + n);
+        haystack.extend_from_slice(&tail);
+        haystack.extend_from_slice(&buffer[..n]);
+        if haystack.windows(needle.len()).any(|window| window == needle) {
+            return Ok(true);
+        }
+        let keep = needle.len().saturating_sub(1).min(haystack.len());
+        tail.clear();
+        tail.extend_from_slice(&haystack[haystack.len() - keep..]);
+    }
+}
+
+fn file_has_user_event(path: &Path, first_line: &str, start_offset: u64) -> Result<bool, std::io::Error> {
+    if let Ok(value) = serde_json::from_str::<Value>(first_line) {
+        if record_has_user_event(&value) {
+            return Ok(true);
+        }
+    }
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start_offset))?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(&line) {
             if record_has_user_event(&value) {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 fn record_has_user_event(v: &Value) -> bool {
@@ -829,7 +1114,11 @@ fn apply_rollout_changes(changes: &[RolloutChange]) -> Result<ApplyRolloutResult
     let mut applied = 0;
     let mut skipped_paths = vec![];
     for change in changes {
-        let content = match fs::read_to_string(&change.path) {
+        let mut source = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&change.path)
+        {
             Ok(v) => v,
             Err(error) if is_file_busy_error(&error) => {
                 skipped_paths.push(change.path.display().to_string());
@@ -837,18 +1126,27 @@ fn apply_rollout_changes(changes: &[RolloutChange]) -> Result<ApplyRolloutResult
             }
             Err(error) => return Err(error.to_string()),
         };
-        let current = split_first_line(&content);
-        if current.first_line != change.original_first_line {
+        let current_len = source.metadata().map_err(to_err)?.len();
+        if current_len != change.original_file_len {
             skipped_paths.push(change.path.display().to_string());
             continue;
         }
-        let mut next_content = String::new();
-        next_content.push_str(&change.updated_first_line);
-        if !change.original_separator.is_empty() {
-            next_content.push_str(&change.original_separator);
+        let current = match read_first_line_record_from(&mut source) {
+            Ok(v) => v,
+            Err(error) if is_file_busy_error(&error) => {
+                skipped_paths.push(change.path.display().to_string());
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if current.first_line != change.original_first_line
+            || current.rest_start as u64 != change.original_offset
+        {
+            skipped_paths.push(change.path.display().to_string());
+            continue;
         }
-        next_content.push_str(&content[current.rest_start..]);
-        fs::write(&change.path, next_content).map_err(to_err)?;
+        rewrite_first_line_from_open_file(&mut source, change).map_err(to_err)?;
+        set_file_mtime(&change.path, change.original_mtime).map_err(to_err)?;
         applied += 1;
     }
     skipped_paths.sort();
@@ -857,6 +1155,51 @@ fn apply_rollout_changes(changes: &[RolloutChange]) -> Result<ApplyRolloutResult
         applied,
         skipped_paths,
     })
+}
+
+fn rewrite_first_line_from_open_file(
+    source: &mut fs::File,
+    change: &RolloutChange,
+) -> Result<(), std::io::Error> {
+    let temp_path = change.path.with_file_name(format!(
+        "{}.provider-sync.{}-{}.tmp",
+        change
+            .path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("rollout"),
+        process::id(),
+        Local::now().format("%Y%m%d%H%M%S%3f")
+    ));
+    let result = (|| -> Result<(), std::io::Error> {
+        {
+            let mut temp = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temp_path)?;
+            temp.write_all(change.updated_first_line.as_bytes())?;
+            if !change.original_separator.is_empty() {
+                temp.write_all(change.original_separator.as_bytes())?;
+            }
+            if change.original_offset < change.original_file_len {
+                source.seek(SeekFrom::Start(change.original_offset))?;
+                std::io::copy(source, &mut temp)?;
+            }
+            temp.flush()?;
+        }
+        let mut temp = fs::File::open(&temp_path)?;
+        source.set_len(0)?;
+        source.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut temp, source)?;
+        source.flush()?;
+        Ok(())
+    })();
+    let cleanup = fs::remove_file(&temp_path);
+    match (result, cleanup) {
+        (Ok(()), _) => Ok(()),
+        (Err(error), _) => Err(error),
+    }
 }
 
 fn increment_provider_count(counts: &mut ProviderCounts, scope: &str, provider: &str) {
@@ -973,7 +1316,6 @@ fn sync_sqlite_session_state(
     target: &str,
     user_event_thread_ids: &HashSet<String>,
     thread_cwd_by_id: &HashMap<String, String>,
-    sqlite_provider_thread_ids: &HashSet<String>,
 ) -> Result<SqliteSyncStats, String> {
     if !path.exists() {
         return Ok(SqliteSyncStats::default());
@@ -987,24 +1329,13 @@ fn sync_sqlite_session_state(
     if table_exists_tx(&tx, "threads")? {
         let columns = sqlite_columns_tx(&tx, "threads")?;
         if columns.contains("model_provider") {
-            let mut updated = 0u64;
-            {
-                let mut stmt = tx
-                    .prepare(
-                        "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
-                    )
-                    .map_err(|e| sqlite_err(e, "update SQLite session provider"))?;
-                for thread_id in sqlite_provider_thread_ids {
-                    if thread_id.trim().is_empty() {
-                        continue;
-                    }
-                    updated += stmt
-                        .execute(params![target, thread_id])
-                        .map_err(|e| sqlite_err(e, "update SQLite session provider"))?
-                        as u64;
-                }
-            }
-            stats.provider_rows = updated;
+            stats.provider_rows = tx
+                .execute(
+                    "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+                    params![target],
+                )
+                .map_err(|e| sqlite_err(e, "update SQLite session provider"))?
+                as u64;
         }
         if columns.contains("has_user_event") {
             let mut updated = 0u64;
@@ -1136,18 +1467,6 @@ fn sqlite_tables(conn: &Connection) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn sqlite_tables_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>, String> {
-    let mut stmt = tx
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-        .map_err(|e| sqlite_err(e, "list SQLite tables"))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| sqlite_err(e, "list SQLite tables"))?;
-    rows.into_iter()
-        .map(|r| r.map_err(|e| sqlite_err(e, "list SQLite tables")))
-        .collect()
-}
-
 fn sqlite_columns(conn: &Connection, table: &str) -> Result<HashSet<String>, String> {
     let sql = format!("PRAGMA table_info({})", quote_ident(table));
     let mut stmt = conn
@@ -1176,13 +1495,6 @@ fn sqlite_columns_tx(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<Hash
 
 fn sqlite_provider_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
     Ok(sqlite_columns(conn, table)?
-        .into_iter()
-        .filter(|name| name == "provider" || name == "model_provider")
-        .collect())
-}
-
-fn sqlite_provider_columns_tx(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<Vec<String>, String> {
-    Ok(sqlite_columns_tx(tx, table)?
         .into_iter()
         .filter(|name| name == "provider" || name == "model_provider")
         .collect())

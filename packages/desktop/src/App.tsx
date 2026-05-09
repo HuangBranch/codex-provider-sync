@@ -5,7 +5,7 @@ const QQ_GROUP_NAME = "Codex Provider Sync 用户交流群";
 const QQ_GROUP_NUMBER = "484630263";
 const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
 const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
-const APP_VERSION = "2.2.3";
+const APP_VERSION = "2.2.4";
 const UPSTREAM_PROJECT_URL = "https://github.com/Dailin521/codex-provider-sync";
 
 type ProviderStat = { provider: string; count: number; source: string };
@@ -32,7 +32,9 @@ type ScanResult = {
     cwd_rows_needing_repair: number;
   } | null;
   project_visibility: ProjectVisibility[];
+  running_codex_processes: RunningCodexProcess[];
 };
+type RunningCodexProcess = { pid: number; name: string };
 
 type BackupInfo = { id: string; path: string; created_at: string };
 type ClearToolDataResult = { removed_paths: string[] };
@@ -87,7 +89,8 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const hasProviderConflict = Boolean(scan?.reserved_provider_conflicts.length);
-  const canSync = Boolean(scan && scan.config_exists && scan.current_provider && !hasProviderConflict);
+  const codexIsRunning = Boolean(scan?.running_codex_processes.length);
+  const canSync = Boolean(scan && scan.config_exists && scan.current_provider && !hasProviderConflict && !codexIsRunning);
 
   useEffect(() => {
     void refreshBackups();
@@ -142,7 +145,7 @@ export default function App() {
         `同步完成：目标 provider ${data.target_provider}`,
         `rollout ${data.changed_rollout_files} 个`,
         `SQLite ${data.changed_sqlite_rows} 行`,
-        `provider 可见性 ${data.changed_sqlite_provider_rows} 行`,
+        `provider 可见性 ${data.changed_sqlite_provider_rows} 行（按上游策略全量同步）`,
         `workspace roots ${data.workspace_roots.updated ? "已更新" : "未变化"}`,
         data.protected_encrypted_thread_count > 0
           ? `保护 ${data.protected_encrypted_thread_count} 个 encrypted rollout 未硬改，但已尝试同步 SQLite 可见性`
@@ -281,7 +284,7 @@ export default function App() {
                 </div>
               )}
               <div style={{ marginTop: 6, color: "#4b5563", lineHeight: 1.6 }}>
-                以当前 provider 为准，同步历史会话的 SQLite 线程可见性与 workspace roots；未加密 rollout 会同步 provider，含 encrypted_content 的 rollout 只同步可见性，不硬改会话本体。不会修改 API key、自定义 URL 或账号授权。
+                以当前 provider 为准，按上游方法同步 SQLite 线程可见性与 workspace roots；未加密 rollout 会同步 provider，含 encrypted_content 的 rollout 只同步 SQLite 可见性，不硬改会话本体。同步/恢复前必须完全退出 Codex，避免退出时覆盖状态或删除后续记录。
               </div>
             </div>
             <label style={{ whiteSpace: "nowrap" }}>
@@ -290,9 +293,20 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
             <button style={btn} disabled={busy} onClick={() => doScan()}>扫描</button>
-            <button style={btn} disabled={busy} onClick={doBackup}>立即备份</button>
+            <button style={btn} disabled={busy || codexIsRunning} onClick={doBackup}>立即备份</button>
             <button style={btnPrimary} disabled={busy || !canSync} onClick={doSync}>执行同步</button>
           </div>
+          {codexIsRunning && (
+            <div style={dangerPanel}>
+              <div style={{ fontWeight: 800 }}>请先完全退出 Codex</div>
+              <div style={{ marginTop: 6, lineHeight: 1.7 }}>
+                当前检测到 Codex / app-server 正在运行。为避免 Codex 退出时覆盖 state_5.sqlite 或归档/删除后续记录，本工具会阻止同步和恢复。
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <List items={scan?.running_codex_processes.map((item) => `${item.name} (${item.pid})`) || []} />
+              </div>
+            </div>
+          )}
           {hasProviderConflict && (
             <div style={dangerPanel}>
               <div style={{ fontWeight: 800 }}>发现 Codex 保留 provider 名冲突</div>
@@ -301,7 +315,7 @@ export default function App() {
                 Codex 官方内置 provider 名不能被自定义 provider 覆盖，否则会出现“Invalid configuration: reserved built-in provider IDs”的报错。
               </div>
               <div style={{ marginTop: 12 }}>
-                <button style={btnDanger} disabled={busy} onClick={doRepairProviderConflicts}>
+                <button style={btnDanger} disabled={busy || codexIsRunning} onClick={doRepairProviderConflicts}>
                   备份并改名为 openai-custom
                 </button>
               </div>
@@ -326,6 +340,7 @@ export default function App() {
             <KV k="config.toml" v={String(scan.config_exists)} />
             <KV k="global state" v={String(scan.global_state_exists)} />
             <KV k="配置 provider" v={scan.configured_providers.join(", ") || "-"} />
+            <KV k="Codex 运行中" v={scan.running_codex_processes.length > 0 ? `是，${scan.running_codex_processes.length} 个进程` : "否"} />
             <KV k="rollout 用户消息线程" v={String(scan.user_event_thread_count)} />
             <KV k="rollout cwd 线程" v={String(scan.thread_cwd_count)} />
             <KV
@@ -408,7 +423,7 @@ export default function App() {
                 <td style={td}>{b.path}</td>
                 <td style={td}>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <button style={btn} disabled={busy} onClick={() => doRestore(b.id)}>恢复</button>
+                    <button style={btn} disabled={busy || codexIsRunning} onClick={() => doRestore(b.id)}>恢复</button>
                     <button style={btnDanger} disabled={busy} onClick={() => setDeleteTarget(b)}>删除</button>
                   </div>
                 </td>
