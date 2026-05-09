@@ -5,7 +5,7 @@ const QQ_GROUP_NAME = "Codex Provider Sync 用户交流群";
 const QQ_GROUP_NUMBER = "484630263";
 const QQ_GROUP_JOIN_URL = "https://qm.qq.com/q/ZSq3H3Iu0q";
 const QQ_GROUP_NUMBER_READY = QQ_GROUP_NUMBER.trim().length > 0;
-const APP_VERSION = "2.2.4";
+const APP_VERSION = "2.2.5";
 const UPSTREAM_PROJECT_URL = "https://github.com/Dailin521/codex-provider-sync";
 
 type ProviderStat = { provider: string; count: number; source: string };
@@ -85,6 +85,13 @@ type ProjectVisibility = {
   rank_preview: string;
   provider_counts: Record<string, number>;
 };
+type NoticeKind = "success" | "error" | "warning" | "info";
+type NoticeState = {
+  kind: NoticeKind;
+  title: string;
+  body: string;
+  details?: string[];
+};
 
 export default function App() {
   const [path, setPath] = useState("");
@@ -98,9 +105,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState<NoticeState | null>(null);
   const hasProviderConflict = Boolean(scan?.reserved_provider_conflicts.length);
   const codexIsRunning = Boolean(scan?.running_codex_processes.length);
-  const canSync = Boolean(scan && scan.config_exists && scan.current_provider && !hasProviderConflict && !codexIsRunning);
 
   useEffect(() => {
     void refreshBackups();
@@ -116,7 +123,9 @@ export default function App() {
     try {
       return await fn();
     } catch (e) {
-      setError(String(e));
+      const body = normalizeError(e);
+      setError(body);
+      showNotice("error", "操作失败", body);
       throw e;
     } finally {
       setBusy(false);
@@ -130,20 +139,29 @@ export default function App() {
     setScan(data);
     if (!options.silent) {
       setMessage("扫描完成");
+      showNotice("success", "扫描完成", buildScanSummary(data), buildScanDetails(data));
     }
     await refreshBackups();
     return data;
   }
 
   async function doBackup() {
+    if (!ensureWriteReady("立即备份")) {
+      return;
+    }
     const data = await run(() =>
       invoke<BackupInfo>("create_backup", { codexHome: path.trim() || null })
     );
-    setMessage(`备份完成：${data.id}`);
+    const body = `备份完成：${data.id}`;
+    setMessage(body);
+    showNotice("success", "备份完成", body, [`路径：${data.path}`]);
     await refreshBackups();
   }
 
   async function doSync() {
+    if (!ensureSyncReady()) {
+      return;
+    }
     const data = await run(() =>
       invoke<SyncResult>("sync_provider", {
         codexHome: path.trim() || null,
@@ -168,16 +186,35 @@ export default function App() {
       setError(data.encrypted_content_warning);
     }
     await doScan({ silent: true, preserveStatus: true });
+    showNotice(
+      "success",
+      "同步完成",
+      `目标 provider：${data.target_provider}`,
+      [
+        `rollout 更新：${data.changed_rollout_files} 个`,
+        `SQLite 更新：${data.changed_sqlite_rows} 行`,
+        `provider 可见性：${data.changed_sqlite_provider_rows} 行`,
+        `workspace roots：${data.workspace_roots.updated ? "已更新" : "未变化"}`,
+        data.encrypted_thread_count > 0 ? `encrypted 会话：${data.encrypted_thread_count} 个，未改消息密文本体` : "",
+        data.skipped_rollout_files.length > 0 ? `跳过文件：${data.skipped_rollout_files.length} 个` : "",
+        data.encrypted_content_warning || ""
+      ].filter(Boolean)
+    );
   }
 
   async function doRepairProviderConflicts() {
+    if (!ensureWriteReady("修复 provider 命名冲突")) {
+      return;
+    }
     const data = await run(() =>
       invoke<ConfigRepairResult>("repair_reserved_provider_conflicts", {
         codexHome: path.trim() || null
       })
     );
     const renamed = data.renamed_providers.map((item) => `${item.from} -> ${item.to}`).join("，");
-    setMessage(`已修复 provider 命名冲突：${renamed}。原 config.toml 已备份到 ${data.backup_path}`);
+    const body = `已修复 provider 命名冲突：${renamed}`;
+    setMessage(`${body}。原 config.toml 已备份到 ${data.backup_path}`);
+    showNotice("success", "修复完成", body, [`备份：${data.backup_path}`]);
     await doScan({ silent: true, preserveStatus: true });
   }
 
@@ -189,10 +226,15 @@ export default function App() {
   }
 
   async function doRestore(id: string) {
+    if (!ensureWriteReady("恢复备份")) {
+      return;
+    }
     await run(() =>
       invoke("restore_backup", { codexHome: path.trim() || null, backupId: id })
     );
-    setMessage(`恢复完成：${id}`);
+    const body = `恢复完成：${id}`;
+    setMessage(body);
+    showNotice("success", "恢复完成", body);
     await doScan({ silent: true, preserveStatus: true });
   }
 
@@ -205,7 +247,9 @@ export default function App() {
       invoke("delete_backup", { codexHome: path.trim() || null, backupId: id })
     );
     setDeleteTarget(null);
-    setMessage(`备份已删除：${id}`);
+    const body = `备份已删除：${id}`;
+    setMessage(body);
+    showNotice("success", "删除完成", body);
     await refreshBackups();
   }
 
@@ -220,6 +264,60 @@ export default function App() {
         ? `本工具数据已清理：${data.removed_paths.length} 个目录`
         : "没有发现需要清理的本工具数据"
     );
+    showNotice(
+      "success",
+      "清理完成",
+      data.removed_paths.length > 0
+        ? `本工具数据已清理：${data.removed_paths.length} 个目录`
+        : "没有发现需要清理的本工具数据",
+      data.removed_paths
+    );
+  }
+
+  function showNotice(kind: NoticeKind, title: string, body: string, details: string[] = []) {
+    setNotice({ kind, title, body, details });
+  }
+
+  function ensureSyncReady() {
+    if (!scan) {
+      showNotice("warning", "请先扫描", "执行同步前需要先扫描 Codex 目录，确认当前 provider 和可见性状态。");
+      return false;
+    }
+    if (!scan.config_exists) {
+      showNotice("warning", "找不到 config.toml", "无法确定当前 provider。请先用 Codex/CCS 配置好账号后再同步。");
+      return false;
+    }
+    if (!scan.current_provider) {
+      showNotice("warning", "缺少当前 provider", "没有读取到当前 provider。请先切换到目标账号/provider 后重新扫描。");
+      return false;
+    }
+    if (hasProviderConflict) {
+      showNotice(
+        "warning",
+        "需要先修复 provider 冲突",
+        "当前 config.toml 存在 Codex 保留 provider 名冲突，请先执行“备份并改名为 openai-custom”。",
+        scan.reserved_provider_conflicts.map((id) => `[model_providers.${id}]`)
+      );
+      return false;
+    }
+    return ensureWriteReady("执行同步");
+  }
+
+  function ensureWriteReady(action: string) {
+    if (busy) {
+      showNotice("info", "正在执行中", "请等待当前操作完成后再继续。");
+      return false;
+    }
+    if (codexIsRunning) {
+      showNotice(
+        "warning",
+        `${action}前请先完全退出 Codex`,
+        "为避免 Codex 退出时覆盖 state_5.sqlite 或归档/删除后续记录，请先完全退出 Codex / Codex App / app-server 后再操作。",
+        scan?.running_codex_processes.map((item) => `${item.name} (${item.pid})`) || []
+      );
+      return false;
+    }
+    return true;
   }
 
   async function copyQQGroupNumber() {
@@ -249,6 +347,13 @@ export default function App() {
           onCopyJoinUrl={copyQQJoinUrl}
           onJoinGroup={joinQQGroup}
           onClose={() => setShowStartupNotice(false)}
+        />
+      )}
+
+      {notice && (
+        <NoticeDialog
+          notice={notice}
+          onClose={() => setNotice(null)}
         />
       )}
 
@@ -303,8 +408,8 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
             <button style={btn} disabled={busy} onClick={() => doScan()}>扫描</button>
-            <button style={btn} disabled={busy || codexIsRunning} onClick={doBackup}>立即备份</button>
-            <button style={btnPrimary} disabled={busy || !canSync} onClick={doSync}>执行同步</button>
+            <button style={btn} disabled={busy} onClick={doBackup}>立即备份</button>
+            <button style={btnPrimary} disabled={busy} onClick={doSync}>执行同步</button>
           </div>
           {codexIsRunning && (
             <div style={dangerPanel}>
@@ -325,7 +430,7 @@ export default function App() {
                 Codex 官方内置 provider 名不能被自定义 provider 覆盖，否则会出现“Invalid configuration: reserved built-in provider IDs”的报错。
               </div>
               <div style={{ marginTop: 12 }}>
-                <button style={btnDanger} disabled={busy || codexIsRunning} onClick={doRepairProviderConflicts}>
+                <button style={btnDanger} disabled={busy} onClick={doRepairProviderConflicts}>
                   备份并改名为 openai-custom
                 </button>
               </div>
@@ -449,7 +554,7 @@ export default function App() {
                 <td style={td}>{b.path}</td>
                 <td style={td}>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <button style={btn} disabled={busy || codexIsRunning} onClick={() => doRestore(b.id)}>恢复</button>
+                    <button style={btn} disabled={busy} onClick={() => doRestore(b.id)}>恢复</button>
                     <button style={btnDanger} disabled={busy} onClick={() => setDeleteTarget(b)}>删除</button>
                   </div>
                 </td>
@@ -531,6 +636,36 @@ function StartupNotice({
         <div style={modalActions}>
           <button style={btn} onClick={onClose}>关闭</button>
           <button style={btnPrimary} onClick={onJoinGroup}>加入交流群</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NoticeDialog({
+  notice,
+  onClose
+}: {
+  notice: NoticeState;
+  onClose: () => void;
+}) {
+  const tone = noticeTone[notice.kind];
+
+  return (
+    <div style={modalBackdrop} role="dialog" aria-modal="true" aria-labelledby="notice-title">
+      <div style={{ ...smallModalCard, border: `1px solid ${tone.border}` }}>
+        <div style={{ color: tone.color, fontSize: 13, fontWeight: 700, letterSpacing: 0.4 }}>
+          {tone.label}
+        </div>
+        <h2 id="notice-title" style={{ margin: "8px 0 10px" }}>{notice.title}</h2>
+        <div style={{ color: "#374151", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{notice.body}</div>
+        {notice.details && notice.details.length > 0 && (
+          <div style={{ ...noticeDetailsBox, border: `1px solid ${tone.border}`, background: tone.bg }}>
+            <List items={notice.details} />
+          </div>
+        )}
+        <div style={modalActions}>
+          <button style={notice.kind === "error" ? btnDanger : btnPrimary} onClick={onClose}>知道了</button>
         </div>
       </div>
     </div>
@@ -634,6 +769,62 @@ function List({ items }: { items: string[] }) {
   );
 }
 
+function normalizeError(errorValue: unknown) {
+  if (errorValue instanceof Error) {
+    return errorValue.message;
+  }
+  if (typeof errorValue === "string") {
+    return errorValue;
+  }
+  if (errorValue && typeof errorValue === "object") {
+    const maybeMessage = "message" in errorValue ? errorValue.message : null;
+    if (typeof maybeMessage === "string") {
+      return maybeMessage;
+    }
+    try {
+      return JSON.stringify(errorValue);
+    } catch {
+      return String(errorValue);
+    }
+  }
+  return String(errorValue);
+}
+
+function buildScanSummary(scan: ScanResult) {
+  const parts = [
+    `Codex 目录：${scan.codex_home}`,
+    `当前 provider：${scan.current_provider || "未读取到"}`,
+    `sessions：${scan.sessions_count} 个`,
+    scan.sqlite_visibility_summary
+      ? `当前 provider 可见活跃会话：${scan.sqlite_visibility_summary.current_provider_active_threads}/${scan.sqlite_visibility_summary.active_threads} 个`
+      : "",
+    scan.running_codex_processes.length > 0
+      ? `检测到 Codex 正在运行：${scan.running_codex_processes.length} 个进程`
+      : "未检测到 Codex 运行进程"
+  ].filter(Boolean);
+
+  return parts.join("\n");
+}
+
+function buildScanDetails(scan: ScanResult) {
+  const details = [
+    `config.toml：${scan.config_exists ? "存在" : "不存在"}`,
+    `state_5.sqlite：${scan.state_db_exists ? "存在" : "不存在"}`,
+    `global state：${scan.global_state_exists ? "存在" : "不存在"}`,
+    `archived_sessions：${scan.archived_sessions_count} 个`,
+    `workspace roots：${scan.sqlite_visibility_summary ? `${scan.sqlite_visibility_summary.workspace_roots_saved} 个` : "-"}`,
+    scan.configured_providers.length > 0 ? `配置 provider：${scan.configured_providers.join(", ")}` : "",
+    scan.reserved_provider_conflicts.length > 0
+      ? `保留 provider 冲突：${scan.reserved_provider_conflicts.join(", ")}`
+      : "",
+    scan.running_codex_processes.length > 0
+      ? `运行中进程：${scan.running_codex_processes.map((item) => `${item.name} (${item.pid})`).join(", ")}`
+      : ""
+  ].filter(Boolean);
+
+  return [...details, ...scan.config_warnings];
+}
+
 function formatCounts(counts: Record<string, number>) {
   const entries = Object.entries(counts);
   return entries.length === 0 ? "-" : entries.map(([k, v]) => `${k}: ${v}`).join(", ");
@@ -684,9 +875,16 @@ const smallModalCard: React.CSSProperties = { width: "min(500px, 100%)", borderR
 const groupBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, marginTop: 16, padding: 16, borderRadius: 16, background: "#eff6ff", border: "1px solid #bfdbfe" };
 const maintenanceBox: React.CSSProperties = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, padding: 14, borderRadius: 14, background: "#f9fafb", border: "1px solid #eef2f7" };
 const noticePanel: React.CSSProperties = { marginTop: 14, padding: 14, borderRadius: 14, background: "#f9fafb", border: "1px solid #eef2f7" };
+const noticeDetailsBox: React.CSSProperties = { marginTop: 14, padding: 14, borderRadius: 14, color: "#374151" };
 const deleteInfoBox: React.CSSProperties = { display: "grid", gap: 8, marginTop: 14, padding: 14, borderRadius: 14, background: "#fef2f2", border: "1px solid #fecaca", color: "#374151" };
 const noticeLabel: React.CSSProperties = { marginBottom: 6, color: "#6b7280", fontSize: 12, fontWeight: 700 };
 const modalActions: React.CSSProperties = { display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 };
+const noticeTone: Record<NoticeKind, { label: string; color: string; bg: string; border: string }> = {
+  success: { label: "操作成功", color: "#166534", bg: "#f0fdf4", border: "#bbf7d0" },
+  error: { label: "操作失败", color: "#b91c1c", bg: "#fef2f2", border: "#fecaca" },
+  warning: { label: "需要处理", color: "#92400e", bg: "#fffbeb", border: "#fde68a" },
+  info: { label: "提示", color: "#1d4ed8", bg: "#eff6ff", border: "#bfdbfe" }
+};
 const table: React.CSSProperties = { width: "100%", borderCollapse: "collapse", fontSize: 14 };
 const th: React.CSSProperties = { textAlign: "left", padding: 10, borderBottom: "1px solid #e5e7eb", background: "#f9fafb" };
 const td: React.CSSProperties = { padding: 10, borderBottom: "1px solid #f3f4f6", verticalAlign: "top" };
