@@ -15,13 +15,13 @@
 - 诊断 rollout 中用户消息线程与 cwd 线程
 - 诊断 Codex Desktop 项目侧可见性，包括最近 50 条首屏命中和 rank
 - 启动时显示版本说明、使用说明与 QQ 群引导弹窗
-- 按上游方法全量同步 SQLite `threads.model_provider`，用于恢复历史会话列表可见性
+- 按上游方法同步 rollout 首行 `session_meta.payload.model_provider` 与 SQLite `threads.model_provider`，用于恢复历史会话列表可见性
 - 修复 SQLite `threads.has_user_event` 与 `threads.cwd`
 - 泛化扫描 SQLite 中其它名为 `provider` 或 `model_provider` 的列
 - 修复 `.codex-global-state.json` 中 workspace roots 相关路径
 - 以当前 `config.toml` 根级 `model_provider` 为同步目标；如果未设置，则按官方订阅内置 `openai` provider 处理
 - 检测 `[model_providers.openai]` 等保留内置 provider 名冲突，并提供备份后一键改名
-- 同步时保护含 `encrypted_content` 且来自其它 provider/account 的 rollout 文件，不再强行改写会话本体；但仍会按上游策略同步 SQLite provider 可见性
+- 含 `encrypted_content` 的会话会同步首行 session_meta 与 SQLite 可见性，但不会改写消息密文本体；继续对话或 compact 仍可能失败
 - 同步/恢复前检测 Codex / Codex App / app-server 是否正在运行，运行中会阻止写入，避免 Codex 退出时覆盖状态或删除后续记录
 - 自动备份
 - 列出备份并显示备份日期
@@ -61,6 +61,6 @@ pnpm bundle:win
 - 备份目录为 `~/.codex/backups_state/provider-sync/<timestamp>`，并兼容读取旧的 `.provider-sync-backups`。
 - 备份包含 `sessions`、`archived_sessions`、`state_5.sqlite`、`state_5.sqlite-wal`、`state_5.sqlite-shm`、`config.toml`、`.codex-global-state.json`。
 - “清理本工具数据”只删除 `~/.codex/backups_state/provider-sync` 和 `~/.codex/.provider-sync-backups`，不会删除 `config.toml`、`auth.json`、`sessions`、`archived_sessions` 或 `state_5.sqlite`。
-- 含 `encrypted_content` 的历史会话跨 provider/account 后，通常只能恢复列表可见性，继续对话或 compact 仍可能失败；v2.2.4 起这些跨 provider/account encrypted 会话不会被强行改写 rollout 文件，但会按上游策略同步 SQLite `threads.model_provider`，避免“同步完成但会话仍不可见”。
+- 含 `encrypted_content` 的历史会话跨 provider/account 后，通常只能恢复列表可见性，继续对话或 compact 仍可能失败；v2.2.4 起按上游方法同步 rollout 首行 session_meta 与 SQLite `threads.model_provider`，但不会改写消息密文本体。
 - 执行同步或恢复前必须关闭 Codex / Codex App / app-server；如果工具检测到 Codex 仍在运行，会直接阻止写入，避免 Codex 退出时覆盖 `state_5.sqlite` 或归档/删除后续记录。
 - 当前实现已通过前端 `pnpm -C packages/desktop build`；后端 Tauri/Rust 构建需要本机安装 Rust 工具链后再运行验证。

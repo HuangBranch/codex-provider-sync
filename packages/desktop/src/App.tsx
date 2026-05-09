@@ -33,8 +33,18 @@ type ScanResult = {
   } | null;
   project_visibility: ProjectVisibility[];
   running_codex_processes: RunningCodexProcess[];
+  sqlite_visibility_summary?: SqliteVisibilitySummary | null;
 };
 type RunningCodexProcess = { pid: number; name: string };
+type SqliteVisibilitySummary = {
+  total_threads: number;
+  active_threads: number;
+  current_provider_threads: number;
+  current_provider_active_threads: number;
+  active_threads_with_cwd: number;
+  active_threads_with_first_user_message: number;
+  workspace_roots_saved: number;
+};
 
 type BackupInfo = { id: string; path: string; created_at: string };
 type ClearToolDataResult = { removed_paths: string[] };
@@ -61,8 +71,8 @@ type SyncResult = {
   changed_sqlite_cwd_rows: number;
   changed_config: boolean;
   workspace_roots: WorkspaceSyncResult;
-  protected_encrypted_rollout_files: string[];
-  protected_encrypted_thread_count: number;
+  encrypted_rollout_files: string[];
+  encrypted_thread_count: number;
   encrypted_content_warning?: string | null;
 };
 type ProjectVisibility = {
@@ -147,8 +157,8 @@ export default function App() {
         `SQLite ${data.changed_sqlite_rows} 行`,
         `provider 可见性 ${data.changed_sqlite_provider_rows} 行（按上游策略全量同步）`,
         `workspace roots ${data.workspace_roots.updated ? "已更新" : "未变化"}`,
-        data.protected_encrypted_thread_count > 0
-          ? `保护 ${data.protected_encrypted_thread_count} 个 encrypted rollout 未硬改，但已尝试同步 SQLite 可见性`
+        data.encrypted_thread_count > 0
+          ? `检测到 ${data.encrypted_thread_count} 个 encrypted rollout，未改消息密文本体`
           : "",
         "config.toml 未修改",
         data.skipped_rollout_files.length > 0 ? `跳过 ${data.skipped_rollout_files.length} 个占用/变化文件` : ""
@@ -284,7 +294,7 @@ export default function App() {
                 </div>
               )}
               <div style={{ marginTop: 6, color: "#4b5563", lineHeight: 1.6 }}>
-                以当前 provider 为准，按上游方法同步 SQLite 线程可见性与 workspace roots；未加密 rollout 会同步 provider，含 encrypted_content 的 rollout 只同步 SQLite 可见性，不硬改会话本体。同步/恢复前必须完全退出 Codex，避免退出时覆盖状态或删除后续记录。
+                以当前 provider 为准，按上游方法同步 rollout 首行 session_meta provider、SQLite 线程可见性与 workspace roots；不会修改消息内容、API key、自定义 URL 或账号授权。同步/恢复前必须完全退出 Codex，避免退出时覆盖状态或删除后续记录。
               </div>
             </div>
             <label style={{ whiteSpace: "nowrap" }}>
@@ -341,6 +351,22 @@ export default function App() {
             <KV k="global state" v={String(scan.global_state_exists)} />
             <KV k="配置 provider" v={scan.configured_providers.join(", ") || "-"} />
             <KV k="Codex 运行中" v={scan.running_codex_processes.length > 0 ? `是，${scan.running_codex_processes.length} 个进程` : "否"} />
+            <KV
+              k="当前 provider 可见"
+              v={
+                scan.sqlite_visibility_summary
+                  ? `${scan.sqlite_visibility_summary.current_provider_active_threads}/${scan.sqlite_visibility_summary.active_threads} 个活跃会话`
+                  : "-"
+              }
+            />
+            <KV
+              k="workspace roots"
+              v={
+                scan.sqlite_visibility_summary
+                  ? `${scan.sqlite_visibility_summary.workspace_roots_saved} 个`
+                  : "-"
+              }
+            />
             <KV k="rollout 用户消息线程" v={String(scan.user_event_thread_count)} />
             <KV k="rollout cwd 线程" v={String(scan.thread_cwd_count)} />
             <KV

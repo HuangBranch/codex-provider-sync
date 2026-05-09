@@ -52,8 +52,8 @@ struct RolloutCollection {
     locked_paths: Vec<String>,
     user_event_thread_ids: HashSet<String>,
     thread_cwd_by_id: HashMap<String, String>,
-    protected_encrypted_paths: Vec<String>,
-    protected_encrypted_thread_ids: HashSet<String>,
+    risky_encrypted_paths: Vec<String>,
+    risky_encrypted_thread_ids: HashSet<String>,
 }
 
 struct RolloutChange {
@@ -94,12 +94,24 @@ struct ScanResult {
     sqlite_repair_stats: Option<SqliteRepairStats>,
     project_visibility: Vec<ProjectVisibility>,
     running_codex_processes: Vec<RunningCodexProcess>,
+    sqlite_visibility_summary: Option<SqliteVisibilitySummary>,
 }
 
 #[derive(Serialize)]
 struct RunningCodexProcess {
     pid: u32,
     name: String,
+}
+
+#[derive(Default, Serialize)]
+struct SqliteVisibilitySummary {
+    total_threads: u64,
+    active_threads: u64,
+    current_provider_threads: u64,
+    current_provider_active_threads: u64,
+    active_threads_with_cwd: u64,
+    active_threads_with_first_user_message: u64,
+    workspace_roots_saved: u64,
 }
 
 #[derive(Serialize)]
@@ -140,8 +152,8 @@ struct SyncResult {
     changed_sqlite_cwd_rows: u64,
     changed_config: bool,
     workspace_roots: WorkspaceSyncResult,
-    protected_encrypted_rollout_files: Vec<String>,
-    protected_encrypted_thread_count: u64,
+    encrypted_rollout_files: Vec<String>,
+    encrypted_thread_count: u64,
     encrypted_content_warning: Option<String>,
 }
 
@@ -219,6 +231,8 @@ fn scan_codex_home(codex_home: Option<String>) -> Result<ScanResult, String> {
     let sqlite_repair_stats =
         read_sqlite_repair_stats(&state_db, &rollout.user_event_thread_ids, &rollout.thread_cwd_by_id)?;
     let project_visibility = read_project_visibility(&home)?;
+    let sqlite_visibility_summary =
+        read_sqlite_visibility_summary(&home, &state_db, &config_info.current_provider)?;
 
     Ok(ScanResult {
         codex_home: home.display().to_string(),
@@ -241,6 +255,7 @@ fn scan_codex_home(codex_home: Option<String>) -> Result<ScanResult, String> {
         sqlite_repair_stats,
         project_visibility,
         running_codex_processes: detect_running_codex_processes(),
+        sqlite_visibility_summary,
     })
 }
 
@@ -416,8 +431,8 @@ fn sync_provider(
         changed_sqlite_cwd_rows: sqlite_stats.cwd_rows,
         changed_config: false,
         workspace_roots,
-        protected_encrypted_rollout_files: rollout.protected_encrypted_paths,
-        protected_encrypted_thread_count: rollout.protected_encrypted_thread_ids.len() as u64,
+        encrypted_rollout_files: rollout.risky_encrypted_paths,
+        encrypted_thread_count: rollout.risky_encrypted_thread_ids.len() as u64,
         encrypted_content_warning,
     })
 }
@@ -917,6 +932,11 @@ fn collect_rollout_metadata(
                     dir_name,
                     &current_provider,
                 );
+                out.risky_encrypted_paths
+                    .push(entry.path().display().to_string());
+                if let Some(thread_id) = &thread_id {
+                    out.risky_encrypted_thread_ids.insert(thread_id.clone());
+                }
             }
             if let Some(thread_id) = &thread_id {
                 match file_has_user_event(entry.path(), &record.first_line, record.rest_start as u64) {
@@ -933,14 +953,7 @@ fn collect_rollout_metadata(
             }
 
             if let Some(target) = target_provider {
-                if current_provider == target {
-                } else if has_encrypted_content {
-                    out.protected_encrypted_paths
-                        .push(entry.path().display().to_string());
-                    if let Some(thread_id) = &thread_id {
-                        out.protected_encrypted_thread_ids.insert(thread_id.clone());
-                    }
-                } else {
+                if current_provider != target {
                     if let Some(payload) = parsed.get_mut("payload").and_then(|v| v.as_object_mut()) {
                         payload.insert(
                             "model_provider".to_string(),
@@ -962,8 +975,8 @@ fn collect_rollout_metadata(
     }
     out.locked_paths.sort();
     out.locked_paths.dedup();
-    out.protected_encrypted_paths.sort();
-    out.protected_encrypted_paths.dedup();
+    out.risky_encrypted_paths.sort();
+    out.risky_encrypted_paths.dedup();
     Ok(out)
 }
 
@@ -1264,7 +1277,7 @@ fn build_encrypted_content_warning(counts: &ProviderCounts, target_provider: &st
     let mut providers: Vec<_> = risky.into_iter().collect();
     providers.sort();
     Some(format!(
-        "{} 个 rollout 文件含 encrypted_content，来自 provider: {}。本工具会同步 SQLite 可见性到 {}，但不会强改这些 rollout 文件；继续对话或 compact 仍可能失败。",
+        "{} 个 rollout 文件含 encrypted_content，来自 provider: {}。本工具会按上游方法同步首行 session_meta provider 与 SQLite 可见性到 {}，但不会改写 encrypted_content 消息密文本体；继续对话或 compact 仍可能失败。",
         risky_total,
         providers.join(", "),
         target_provider
@@ -1424,6 +1437,68 @@ fn read_sqlite_repair_stats(
         }
     }
     Ok(Some(stats))
+}
+
+fn read_sqlite_visibility_summary(
+    home: &Path,
+    path: &Path,
+    target_provider: &str,
+) -> Result<Option<SqliteVisibilitySummary>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = open_sqlite(path)?;
+    if !table_exists(&conn, "threads")? {
+        return Ok(None);
+    }
+    let columns = sqlite_columns(&conn, "threads")?;
+    let archived_expr = if columns.contains("archived") {
+        "COALESCE(archived, 0)"
+    } else {
+        "0"
+    };
+    let provider_expr = if columns.contains("model_provider") {
+        "COALESCE(model_provider, '')"
+    } else {
+        "''"
+    };
+    let cwd_expr = if columns.contains("cwd") {
+        "COALESCE(cwd, '')"
+    } else {
+        "''"
+    };
+    let first_user_expr = if columns.contains("first_user_message") {
+        "COALESCE(first_user_message, '')"
+    } else {
+        "''"
+    };
+    let sql = format!(
+        "SELECT \
+            COUNT(*) AS total_threads, \
+            SUM(CASE WHEN {archived_expr} = 0 THEN 1 ELSE 0 END) AS active_threads, \
+            SUM(CASE WHEN {provider_expr} = ?1 THEN 1 ELSE 0 END) AS current_provider_threads, \
+            SUM(CASE WHEN {archived_expr} = 0 AND {provider_expr} = ?1 THEN 1 ELSE 0 END) AS current_provider_active_threads, \
+            SUM(CASE WHEN {archived_expr} = 0 AND {cwd_expr} <> '' THEN 1 ELSE 0 END) AS active_threads_with_cwd, \
+            SUM(CASE WHEN {archived_expr} = 0 AND {first_user_expr} <> '' THEN 1 ELSE 0 END) AS active_threads_with_first_user_message \
+         FROM threads"
+    );
+    let mut summary = conn
+        .query_row(&sql, params![target_provider], |row| {
+            Ok(SqliteVisibilitySummary {
+                total_threads: row.get::<_, i64>(0)?.max(0) as u64,
+                active_threads: row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64,
+                current_provider_threads: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+                current_provider_active_threads: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+                active_threads_with_cwd: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                active_threads_with_first_user_message: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                workspace_roots_saved: 0,
+            })
+        })
+        .map_err(|e| sqlite_err(e, "read SQLite visibility summary"))?;
+    summary.workspace_roots_saved = read_workspace_roots(home)
+        .map(|roots| roots.len() as u64)
+        .unwrap_or(0);
+    Ok(Some(summary))
 }
 
 fn open_sqlite(path: &Path) -> Result<Connection, String> {
@@ -1816,8 +1891,16 @@ fn sync_workspace_roots(home: &Path) -> Result<WorkspaceSyncResult, String> {
     let existing_saved = path_array(obj.get("electron-saved-workspace-roots"));
     let existing_project_order = path_array(obj.get("project-order"));
     let existing_active = path_array(obj.get("active-workspace-roots"));
+    let discovered_roots = cwd_stats
+        .iter()
+        .map(|stat| to_desktop_workspace_path(&stat.cwd))
+        .collect::<Vec<_>>();
+    let no_saved_roots =
+        existing_saved.is_empty() && existing_project_order.is_empty() && existing_active.is_empty();
     let next_saved = dedupe_paths(
-        if existing_project_order.is_empty() {
+        if no_saved_roots {
+            discovered_roots.clone()
+        } else if existing_project_order.is_empty() {
             existing_saved
                 .iter()
                 .chain(existing_active.iter())
@@ -1833,7 +1916,9 @@ fn sync_workspace_roots(home: &Path) -> Result<WorkspaceSyncResult, String> {
         },
     );
     let next_project_order = dedupe_paths(
-        if existing_project_order.is_empty() {
+        if no_saved_roots {
+            discovered_roots
+        } else if existing_project_order.is_empty() {
             next_saved.clone()
         } else {
             existing_project_order
